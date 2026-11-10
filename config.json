@@ -1,16 +1,128 @@
 {
-  "stocks": [
-    {"code": "018260", "name": "삼성에스디에스", "sector": "IT서비스"},
-    {"code": "005930", "name": "삼성전자", "sector": "반도체"},
-    {"code": "017670", "name": "SK텔레콤", "sector": "통신"},
-    {"code": "005380", "name": "현대차", "sector": "자동차"},
-    {"code": "012330", "name": "현대모비스", "sector": "자동차"},
-    {"code": "204320", "name": "HL만도", "sector": "자동차"},
-    {"code": "058610", "name": "에스피지", "sector": "로봇"},
-    {"code": "108490", "name": "로보티즈", "sector": "로봇"}
+  "markets": [
+    {
+      "id": "kr",
+      "name": "국장",
+      "cur": "KRW",
+      "source": "fdr",
+      "note": "평일 09:00~15:30 30분마다 갱신",
+      "stocks": [
+        {
+          "code": "018260",
+          "name": "삼성에스디에스",
+          "sector": "IT서비스"
+        },
+        {
+          "code": "005930",
+          "name": "삼성전자",
+          "sector": "반도체"
+        },
+        {
+          "code": "017670",
+          "name": "SK텔레콤",
+          "sector": "통신"
+        },
+        {
+          "code": "005380",
+          "name": "현대차",
+          "sector": "자동차"
+        },
+        {
+          "code": "012330",
+          "name": "현대모비스",
+          "sector": "자동차"
+        },
+        {
+          "code": "204320",
+          "name": "HL만도",
+          "sector": "자동차"
+        },
+        {
+          "code": "058610",
+          "name": "에스피지",
+          "sector": "로봇"
+        },
+        {
+          "code": "108490",
+          "name": "로보티즈",
+          "sector": "로봇"
+        }
+      ]
+    },
+    {
+      "id": "us",
+      "name": "미장",
+      "cur": "USD",
+      "source": "fdr",
+      "note": "미국 장중(한국 밤 11:30~새벽 6시) 1시간마다 갱신",
+      "stocks": [
+        {
+          "code": "CRCL",
+          "name": "서클",
+          "news": "써클 CRCL"
+        },
+        {
+          "code": "GOOGL",
+          "name": "구글",
+          "news": "알파벳 구글"
+        },
+        {
+          "code": "AMZN",
+          "name": "아마존",
+          "news": "아마존"
+        },
+        {
+          "code": "SOXL",
+          "name": "SOXL",
+          "news": "SOXL 반도체 3배"
+        },
+        {
+          "code": "KORU",
+          "name": "KORU",
+          "news": "KORU 한국 3배"
+        },
+        {
+          "code": "QQQ",
+          "name": "QQQ",
+          "news": "QQQ 나스닥100"
+        },
+        {
+          "code": "QLD",
+          "name": "QLD",
+          "news": "QLD 나스닥 2배"
+        }
+      ]
+    },
+    {
+      "id": "coin",
+      "name": "코인",
+      "cur": "KRW",
+      "source": "upbit",
+      "news_suffix": "시세",
+      "note": "업비트 원화 시세 · 24시간 2시간마다 갱신",
+      "stocks": [
+        {
+          "code": "KRW-BTC",
+          "name": "비트코인"
+        },
+        {
+          "code": "KRW-ETH",
+          "name": "이더리움"
+        },
+        {
+          "code": "KRW-SOL",
+          "name": "솔라나"
+        }
+      ]
+    }
   ],
   "indicators": {
-    "ma": [5, 20, 60, 120],
+    "ma": [
+      5,
+      20,
+      60,
+      120
+    ],
     "bollinger_period": 20,
     "bollinger_k": 2,
     "rsi_period": 14,
@@ -22,14 +134,38 @@
     "cci_oversold": -100,
     "cci_overbought": 100,
     "fear_extreme": 25,
-    "greed_extreme": 75
+    "greed_extreme": 75,
+    "volume_surge": 2.0,
+    "investor_days": 3
   },
   "signal": {
     "min_score": 2,
     "strong_score": 3
   },
   "news": {
-    "positive_words": ["목표가 상향", "목표주가 상향", "상향", "수주", "흑자전환", "최대 실적", "서프라이즈", "신고가", "자사주"],
-    "negative_words": ["목표가 하향", "목표주가 하향", "하향", "적자", "쇼크", "감소", "파업", "소송", "리콜", "유상증자", "신저가"]
+    "positive_words": [
+      "목표가 상향",
+      "목표주가 상향",
+      "상향",
+      "수주",
+      "흑자전환",
+      "최대 실적",
+      "서프라이즈",
+      "신고가",
+      "자사주"
+    ],
+    "negative_words": [
+      "목표가 하향",
+      "목표주가 하향",
+      "하향",
+      "적자",
+      "쇼크",
+      "감소",
+      "파업",
+      "소송",
+      "리콜",
+      "유상증자",
+      "신저가"
+    ]
   }
 }
