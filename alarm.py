@@ -43,28 +43,56 @@ def fetch_ohlcv(code: str, source: str = "fdr") -> pd.DataFrame:
         return fetch_upbit(code)
     import FinanceDataReader as fdr  # 실행 환경에서만 필요
 
-    start = (dt.datetime.now(KST) - dt.timedelta(days=400)).strftime("%Y-%m-%d")
+    start = (dt.datetime.now(KST) - dt.timedelta(days=620)).strftime("%Y-%m-%d")
     df = fdr.DataReader(code, start)
     df = df.rename(columns=str.title)[["Open", "High", "Low", "Close", "Volume"]]
     return df.dropna().astype(float)
 
 
-def fetch_upbit(market: str, count: int = 200) -> pd.DataFrame:
-    """업비트 원화 마켓 일봉 (하루 = 매일 오전 9시 시작). 현재 진행 중인 봉 포함."""
+def fetch_upbit(market: str, total: int = 480) -> pd.DataFrame:
+    """업비트 원화 마켓 일봉 (하루 = 매일 오전 9시 시작). 현재 진행 중인 봉 포함. 200개씩 나눠 받음."""
+    import time
+
     import requests
 
-    r = requests.get(
-        "https://api.upbit.com/v1/candles/days",
-        params={"market": market, "count": count},
-        headers={"accept": "application/json"},
-        timeout=15,
-    )
-    r.raise_for_status()
-    df = pd.DataFrame(r.json())
+    rows, to = [], None
+    while len(rows) < total:
+        params = {"market": market, "count": min(200, total - len(rows))}
+        if to:
+            params["to"] = to
+        r = requests.get("https://api.upbit.com/v1/candles/days", params=params,
+                         headers={"accept": "application/json"}, timeout=15)
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        rows += batch
+        to = batch[-1]["candle_date_time_utc"]
+        time.sleep(0.15)  # 업비트 요청 제한 배려
+    df = pd.DataFrame(rows).drop_duplicates("candle_date_time_kst")
     df.index = pd.to_datetime(df["candle_date_time_kst"].str[:10])
     df = df.rename(columns={"opening_price": "Open", "high_price": "High", "low_price": "Low",
                             "trade_price": "Close", "candle_acc_trade_volume": "Volume"})
     return df[["Open", "High", "Low", "Close", "Volume"]].sort_index().astype(float)
+
+
+def fetch_upbit_intraday(market: str, unit: int = 15, count: int = 96) -> pd.DataFrame | None:
+    """업비트 분봉 (기본 15분봉 96개 = 최근 24시간)."""
+    import requests
+
+    try:
+        r = requests.get(f"https://api.upbit.com/v1/candles/minutes/{unit}",
+                         params={"market": market, "count": count},
+                         headers={"accept": "application/json"}, timeout=15)
+        r.raise_for_status()
+        df = pd.DataFrame(r.json())
+        df.index = pd.to_datetime(df["candle_date_time_kst"])
+        df = df.rename(columns={"opening_price": "Open", "high_price": "High", "low_price": "Low",
+                                "trade_price": "Close", "candle_acc_trade_volume": "Volume"})
+        return df[["Open", "High", "Low", "Close", "Volume"]].sort_index().astype(float)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] {market} 분봉 실패: {e}")
+        return None
 
 
 def fetch_crypto_fear_greed() -> dict | None:
@@ -575,7 +603,7 @@ def save_state(state: dict) -> None:
 
 # ---------------------------------------------------------------- 대시보드
 
-def history_marks(ind: pd.DataFrame, n: int = 60) -> list[dict]:
+def history_marks(ind: pd.DataFrame, n: int = 260) -> list[dict]:
     """최근 n일 동안 매일 같은 기준(기술적 지표 2개 이상)으로 판정한 과거 신호와 크로스."""
     min_score = CONFIG["signal"]["min_score"]
     marks = []
@@ -588,33 +616,38 @@ def history_marks(ind: pd.DataFrame, n: int = 60) -> list[dict]:
         b, s = tech_reasons(last, prev)
         day = ind.index[i].strftime("%m/%d")
         for d, name in crosses(last, prev):
-            marks.append({"i": i - start, "kind": "gc" if d == "buy" else "dc", "label": name, "day": day,
+            marks.append({"i": i, "kind": "gc" if d == "buy" else "dc", "label": name, "day": day,
                           "price": float(last["Close"]), "strong": False})
         # 신호가 며칠 연속되면 차트가 화살표로 덮이므로, 신호가 '처음 켜진 날'만 표시
         is_buy, is_sell = len(b) >= min_score, len(s) >= min_score
         strong_score = CONFIG["signal"]["strong_score"]
         px = float(last["Close"])
         if is_buy and not was_buy:
-            marks.append({"i": i - start, "kind": "buy", "label": ", ".join(b), "day": day,
+            marks.append({"i": i, "kind": "buy", "label": ", ".join(b), "day": day,
                           "price": px, "strong": len(b) >= strong_score})
         if is_sell and not was_sell:
-            marks.append({"i": i - start, "kind": "sell", "label": ", ".join(s), "day": day,
+            marks.append({"i": i, "kind": "sell", "label": ", ".join(s), "day": day,
                           "price": px, "strong": len(s) >= strong_score})
         was_buy, was_sell = is_buy, is_sell
     return marks
 
 
-def chart(ind: pd.DataFrame, marks: list[dict], n: int = 60, cur: str = "KRW") -> str:
-    d = ind.tail(n)
-    cols = ["Close", "BB_UP", "BB_LO", "MA5", "MA20", "MA60"]
+def chart(ind: pd.DataFrame, marks: list[dict], n: int = 60, cur: str = "KRW", style: str = "line",
+          label_all: bool = True) -> str:
+    """일봉 차트. style='candle'이면 봉 차트, 'line'이면 선 차트. marks의 i는 ind 전체 기준 위치."""
+    start = max(len(ind) - n, 0)
+    d = ind.iloc[start:]
+    # 봉 차트(1주·1달)는 볼린저·60일선을 빼서 봉이 크게 보이게 함
+    cols = ["High", "Low", "MA5", "MA20"] if style == "candle" else ["Close", "BB_UP", "BB_LO", "MA5", "MA20", "MA60"]
     vals = d[cols].stack().dropna()
     lo, hi = float(vals.min()), float(vals.max())
     w, h, pad = 320, 170, 26
     span = (hi - lo) or 1
-    step = w / max(len(d) - 1, 1)
+    step = w / max(len(d) - 1, 1) if style == "line" else w / max(len(d), 1)
+    off = 0 if style == "line" else step / 2
 
     def x(i: int) -> float:
-        return i * step
+        return off + i * step
 
     def y(v: float) -> float:
         return pad + (hi - v) / span * (h - 2 * pad)
@@ -623,19 +656,33 @@ def chart(ind: pd.DataFrame, marks: list[dict], n: int = 60, cur: str = "KRW") -
         pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(d[col]) if not np.isnan(v))
         return f'<polyline class="{cls}" points="{pts}"/>' if pts else ""
 
-    svg = [line("BB_UP", "bb"), line("BB_LO", "bb"), line("MA60", "ma60"), line("MA20", "ma20"),
-           line("MA5", "ma5"), line("Close", "px")]
+    if style == "candle":
+        svg = [line("MA20", "ma20"), line("MA5", "ma5")]
+    else:
+        svg = [line("BB_UP", "bb"), line("BB_LO", "bb"), line("MA60", "ma60"), line("MA20", "ma20"), line("MA5", "ma5")]
+    if style == "candle":
+        bw = max(step * 0.6, 1.5)
+        for i, (_, r) in enumerate(d.iterrows()):
+            up = r["Close"] >= r["Open"]
+            top, bot = y(max(r["Open"], r["Close"])), y(min(r["Open"], r["Close"]))
+            svg.append(f'<line class="{"cu" if up else "cd"}" x1="{x(i):.1f}" x2="{x(i):.1f}" '
+                       f'y1="{y(r["High"]):.1f}" y2="{y(r["Low"]):.1f}"/>'
+                       f'<rect class="{"cu" if up else "cd"}" x="{x(i) - bw / 2:.1f}" y="{top:.1f}" '
+                       f'width="{bw:.1f}" height="{max(bot - top, 0.8):.1f}"/>')
+    else:
+        svg.append(line("Close", "px"))
     for m in marks:
-        i = m["i"]
-        if i >= len(d):
+        if m["i"] < start:
             continue
+        i = m["i"] - start
         px = float(d["Close"].iloc[i])
         cx = x(i)
         title = "<title>" + html.escape(m["day"] + " " + money(m["price"], cur) + " · " + m["label"]) + "</title>"
         tx = min(max(cx, 14), w - 14)
         if m["kind"] in ("buy", "sell"):
             up = m["kind"] == "buy"  # 매수는 가격 아래, 매도는 가격 위에 표시
-            yy = min(y(px) + 12, h - 14) if up else max(y(px) - 12, 14)
+            ref = float(d["Low"].iloc[i] if up else d["High"].iloc[i]) if style == "candle" else px
+            yy = min(y(ref) + 12, h - 14) if up else max(y(ref) - 12, 14)
             if m.get("strong"):
                 svg.append(f'<text class="emo" x="{cx:.1f}" y="{yy + 5:.1f}" text-anchor="middle">'
                            f'{"🔥" if up else "🐵"}{title}</text>')
@@ -643,19 +690,78 @@ def chart(ind: pd.DataFrame, marks: list[dict], n: int = 60, cur: str = "KRW") -
                 svg.append(f'<path class="mk-buy" d="M{cx:.1f},{yy - 6:.1f} l-5,8 h10 z">{title}</path>')
             else:
                 svg.append(f'<path class="mk-sell" d="M{cx:.1f},{yy + 6:.1f} l-5,-8 h10 z">{title}</path>')
-            ly = yy + 16 if up else yy - 10
-            svg.append(f'<text class="pl {"pb" if up else "ps"}" x="{tx:.1f}" y="{ly:.1f}" '
-                       f'text-anchor="middle">{man(px, cur)}</text>')
+            if label_all or m.get("strong"):
+                ly = yy + 16 if up else yy - 10
+                svg.append(f'<text class="pl {"pb" if up else "ps"}" x="{tx:.1f}" y="{ly:.1f}" '
+                           f'text-anchor="middle">{man(px, cur)}</text>')
         else:
             ma = float(d["MA20"].iloc[i])
+            if np.isnan(ma):
+                continue
             cls = "mk-gc" if m["kind"] == "gc" else "mk-dc"
             svg.append(f'<circle class="{cls}" cx="{cx:.1f}" cy="{y(ma):.1f}" r="4.5">{title}</circle>')
-    first, last_day = d.index[0].strftime("%m/%d"), d.index[-1].strftime("%m/%d")
+    fmt = "%y/%m/%d" if n > 200 else "%m/%d"
+    first, last_day = d.index[0].strftime(fmt), d.index[-1].strftime(fmt)
     return (
         f'<svg viewBox="0 0 {w} {h}" class="chart" role="img" '
-        f'aria-label="최근 {n}일 종가·이동평균선·볼린저밴드와 매수·매도 표시">{"".join(svg)}</svg>'
+        f'aria-label="최근 {len(d)}일 차트와 매수·매도 표시">{"".join(svg)}</svg>'
         f'<div class="axis"><span>{first}</span><span>{last_day}</span></div>'
     )
+
+
+def intraday_chart(df: pd.DataFrame, cur: str = "KRW") -> str:
+    """코인 1일 차트: 15분봉 캔들 + 평균가(전체 평균) 기준선. 일봉 지표 신호는 없음."""
+    w, h, pad = 320, 170, 18
+    lo, hi = float(df["Low"].min()), float(df["High"].max())
+    span = (hi - lo) or 1
+    step = w / len(df)
+    bw = max(step * 0.6, 1.2)
+
+    def y(v: float) -> float:
+        return pad + (hi - v) / span * (h - 2 * pad)
+
+    svg = []
+    for i, (_, r) in enumerate(df.iterrows()):
+        cx = step / 2 + i * step
+        up = r["Close"] >= r["Open"]
+        top, bot = y(max(r["Open"], r["Close"])), y(min(r["Open"], r["Close"]))
+        svg.append(f'<line class="{"cu" if up else "cd"}" x1="{cx:.1f}" x2="{cx:.1f}" y1="{y(r["High"]):.1f}" '
+                   f'y2="{y(r["Low"]):.1f}"/><rect class="{"cu" if up else "cd"}" x="{cx - bw / 2:.1f}" '
+                   f'y="{top:.1f}" width="{bw:.1f}" height="{max(bot - top, 0.8):.1f}"/>')
+    hi_i, lo_i = int(df["High"].values.argmax()), int(df["Low"].values.argmin())
+    for idx, val, up in ((hi_i, hi, False), (lo_i, lo, True)):
+        cx = min(max(step / 2 + idx * step, 18), w - 18)
+        yy = y(val) + (12 if up else -5)
+        svg.append(f'<text class="pl {"pb" if up else "ps"}" x="{cx:.1f}" y="{yy:.1f}" text-anchor="middle">'
+                   f'{"저" if up else "고"} {man(val, cur)}</text>')
+    chg = (df["Close"].iloc[-1] / df["Open"].iloc[0] - 1) * 100
+    return (
+        f'<svg viewBox="0 0 {w} {h}" class="chart" role="img" aria-label="최근 24시간 15분봉 차트">{"".join(svg)}</svg>'
+        f'<div class="axis"><span>{df.index[0]:%m/%d %H:%M}</span><span>24시간 {chg:+.2f}%</span>'
+        f'<span>{df.index[-1]:%H:%M}</span></div>'
+        f'<p class="muted small">1일 차트는 흐름만 보는 용도예요. 매수·매도 신호는 일봉 기준이라 3달 차트 등에서 확인하세요.</p>'
+    )
+
+
+PERIODS = [("1w", "1주"), ("1m", "1달"), ("3m", "3달"), ("6m", "6달"), ("1y", "1년")]
+
+
+def period_bars(mid: str) -> dict:
+    if mid == "coin":  # 코인은 주말에도 거래
+        return {"1w": 7, "1m": 30, "3m": 90, "6m": 180, "1y": 365}
+    return {"1w": 5, "1m": 21, "3m": 63, "6m": 126, "1y": 250}
+
+
+def charts_html(ind: pd.DataFrame, marks: list[dict], mid: str, cur: str, intraday: pd.DataFrame | None) -> str:
+    out = []
+    if mid == "coin":
+        inner = intraday_chart(intraday, cur) if intraday is not None and len(intraday) > 5 \
+            else '<p class="muted small">1일 차트를 받지 못했어요.</p>'
+        out.append(f'<div class="ch" data-p="1d">{inner}</div>')
+    for key, n in period_bars(mid).items():
+        style = "candle" if key in ("1w", "1m") else "line"
+        out.append(f'<div class="ch" data-p="{key}">{chart(ind, marks, n, cur, style, label_all=n <= 100)}</div>')
+    return "".join(out)
 
 
 def recent_marks_html(marks: list[dict], now_price: float, k: int = 6, cur: str = "KRW") -> str:
@@ -731,7 +837,7 @@ def render_cards(rows: list[dict], cur: str, show_pf: bool) -> str:
         cards.append(f"""
 <div class="card">
   <div class="top"><h2>{e(r["name"])} <small>{e(r["code"])}</small></h2>{badge(r)}</div>
-  <div class="price"><b>{price_txt(r["close"], cur)}</b><span class="{"up" if r["chg"] >= 0 else "down"}">{r["chg"]:+.2f}%</span></div>
+  <div class="price"><b>{price_txt(r["close"], cur)}</b><span class="{"up" if r["chg"] >= 0 else "down"}">{r["chg"]:+.2f}%</span><span class="hl">고 {price_txt(r["day_hi"], cur)} · 저 {price_txt(r["day_lo"], cur)}</span></div>
   {pf}
   <div class="why {"sb" if r["signal"]["buy_level"] else "ss" if r["signal"]["sell_level"] else ""}">{e(summary_line(r["signal"]))}</div>
   {r["spark"]}
@@ -777,7 +883,8 @@ def render_dashboard(markets: list[dict], now: dt.datetime, show_pf: bool) -> st
         badge = f'<span class="cnt">{n_sig}</span>' if n_sig else ""
         tabs.append(f'<button class="tab{" on" if i == 0 else ""}" data-tab="{m["id"]}">{e(m["name"])}{badge}</button>')
         sections.append(f"""
-<section id="{m["id"]}" class="pane"{"" if i == 0 else " hidden"}>
+<section id="{m["id"]}" class="pane" data-p="3m"{"" if i == 0 else " hidden"}>
+<div class="periods">{"".join(f'<button class="per{" on" if k == "3m" else ""}" data-p="{k}">{lab}</button>' for k, lab in ([("1d", "1일")] if m["id"] == "coin" else []) + PERIODS)}</div>
 <div class="sum">
   <div><label>{e(fg_label)}</label><b class="{fg_cls}">{fg_txt}</b></div>
   {idx_html}{total_html}
@@ -820,7 +927,12 @@ label{{display:block;font-size:12px}}.card{{background:var(--card);border:1px so
 footer{{font-size:12px;color:var(--mut);margin:20px 0}}
 .tabs{{position:sticky;top:0;z-index:5;display:flex;gap:6px;background:var(--bg);padding:10px 0;margin-top:6px}}
 .tab{{flex:1;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:10px;padding:9px 0;font:inherit;font-weight:700;cursor:pointer}}
-.pane{{scroll-margin-top:64px}}.tab.on{{background:var(--fg);color:var(--bg);border-color:var(--fg)}}.cnt{{display:inline-block;margin-left:5px;background:var(--sell);color:#fff;border-radius:99px;font-size:11px;padding:0 6px}}
+.pane{{scroll-margin-top:64px}}
+.periods{{display:flex;gap:4px;margin:2px 0 8px;overflow-x:auto}}.per{{flex:1;min-width:44px;border:1px solid var(--line);background:var(--card);color:var(--mut);border-radius:99px;padding:5px 0;font:inherit;font-size:13px;cursor:pointer}}
+.per.on{{color:var(--fg);border-color:var(--fg);font-weight:700}}
+.ch{{display:none}}.pane[data-p="1d"] .ch[data-p="1d"]{{display:block}}.pane[data-p="1w"] .ch[data-p="1w"]{{display:block}}.pane[data-p="1m"] .ch[data-p="1m"]{{display:block}}.pane[data-p="3m"] .ch[data-p="3m"]{{display:block}}.pane[data-p="6m"] .ch[data-p="6m"]{{display:block}}.pane[data-p="1y"] .ch[data-p="1y"]{{display:block}}
+.chart .cu{{fill:var(--up);stroke:var(--up)}}.chart .cd{{fill:var(--down);stroke:var(--down)}}.chart line.cu,.chart line.cd{{stroke-width:1}}
+.hl{{font-size:12px;color:var(--mut);margin-left:auto}}.tab.on{{background:var(--fg);color:var(--bg);border-color:var(--fg)}}.cnt{{display:inline-block;margin-left:5px;background:var(--sell);color:#fff;border-radius:99px;font-size:11px;padding:0 6px}}
 </style></head><body><main>
 <h1>내 주식 타이밍 보드</h1>
 <div class="muted">{now:%Y-%m-%d %H:%M} 기준 · 10분마다 새로고침</div>
@@ -843,6 +955,18 @@ footer{{font-size:12px;color:var(--mut);margin:20px 0}}
     try {{ history.replaceState(null, "", "#" + id); }} catch (e) {{}}
   }}
   tabs.forEach(function (t) {{ t.addEventListener("click", function () {{ show(t.dataset.tab); }}); }});
+  function setPeriod(pane, p) {{
+    if (!pane.querySelector('.per[data-p="' + p + '"]')) return;
+    pane.dataset.p = p;
+    pane.querySelectorAll(".per").forEach(function (b) {{ b.classList.toggle("on", b.dataset.p === p); }});
+    try {{ localStorage.setItem("period-" + pane.id, p); }} catch (e) {{}}
+  }}
+  panes.forEach(function (pane) {{
+    pane.querySelectorAll(".per").forEach(function (b) {{
+      b.addEventListener("click", function () {{ setPeriod(pane, b.dataset.p); }});
+    }});
+    try {{ var saved = localStorage.getItem("period-" + pane.id); if (saved) setPeriod(pane, saved); }} catch (e) {{}}
+  }});
   if (location.hash) show(location.hash.slice(1));
 }})();
 </script>
@@ -864,7 +988,8 @@ def load_portfolio() -> dict:
 
 
 def analyze(stock: dict, df: pd.DataFrame, pf: dict, fg: dict | None, news: list[dict],
-            inv: list[dict] | None = None, now: dt.datetime | None = None, market: dict | None = None) -> dict:
+            inv: list[dict] | None = None, now: dt.datetime | None = None, market: dict | None = None,
+            intraday: pd.DataFrame | None = None) -> dict:
     market = market or {"id": "kr", "name": "국장", "cur": "KRW"}
     mid, cur = market["id"], market["cur"]
     ind = compute_indicators(df, CONFIG["indicators"])
@@ -889,8 +1014,10 @@ def analyze(stock: dict, df: pd.DataFrame, pf: dict, fg: dict | None, news: list
         "news": news,
         "inv": inv or [],
         "vol_ratio": float(vol_ratio),
-        "marks": (marks := history_marks(ind)),
-        "spark": chart(ind, marks, cur=cur),
+        "marks": (marks := history_marks(ind, max(period_bars(mid).values()))),
+        "spark": charts_html(ind, marks, mid, cur, intraday),
+        "day_hi": float(last["High"]),
+        "day_lo": float(last["Low"]),
         "hist": recent_marks_html(marks, float(last["Close"]), cur=cur),
     }
     for n in CONFIG["indicators"]["ma"]:
@@ -942,7 +1069,8 @@ def main() -> int:
                 q = fetch_quote(s["code"]) if m["id"] == "kr" else None
                 inv = fetch_investor(s["code"]) if m["id"] == "kr" else None
                 news = fetch_news(s.get("news") or s["name"], suffix=m.get("news_suffix", "주가"))
-                row = analyze(s, apply_quote(df, q), pf, fg, news, inv, now, m)
+                intra = fetch_upbit_intraday(s["code"]) if m["id"] == "coin" else None
+                row = analyze(s, apply_quote(df, q), pf, fg, news, inv, now, m, intra)
                 if q:  # 등락률은 증권사 앱과 같은 공식 값 사용
                     row["chg"] = q["chg"]
                 rows.append(row)
