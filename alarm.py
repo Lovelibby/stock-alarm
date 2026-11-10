@@ -13,6 +13,7 @@ import datetime as dt
 import html
 import json
 import os
+import re
 import sys
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -26,7 +27,12 @@ CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 STATE_PATH = ROOT / "state.json"
 DOCS = ROOT / "docs"
 KST = dt.timezone(dt.timedelta(hours=9))
-UA = {"User-Agent": "Mozilla/5.0 (stock-alarm; +https://github.com)"}
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+}
+FALLING = {"FALLING", "LOWER_LIMIT", "5", "4"}
 
 
 # ---------------------------------------------------------------- 데이터 수집
@@ -41,34 +47,98 @@ def fetch_ohlcv(code: str) -> pd.DataFrame:
     return df.dropna().astype(float)
 
 
+def _num(x) -> float:
+    return float(str(x).replace(",", "").replace("%", "").replace("+", ""))
+
+
+def _signed_ratio(d: dict) -> float:
+    """네이버 응답의 등락률에 하락이면 음수 부호를 붙임."""
+    ratio = abs(_num(d["fluctuationsRatio"]))
+    cmp = d.get("compareToPreviousPrice") or {}
+    falling = str(cmp.get("name", "")).upper() in FALLING or str(cmp.get("code", "")) in FALLING
+    if not cmp:  # 부호 정보가 없으면 원래 값 그대로
+        return _num(d["fluctuationsRatio"])
+    return -ratio if falling else ratio
+
+
+def _naver(path: str) -> dict:
+    import requests
+
+    r = requests.get(f"https://m.stock.naver.com/api/{path}", headers=UA, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
 def fetch_index_change(symbol: str) -> float | None:
+    """코스피·코스닥 실시간 등락률(네이버). 실패하면 일봉으로 계산."""
+    code = {"KS11": "KOSPI", "KQ11": "KOSDAQ"}[symbol]
+    try:
+        return _signed_ratio(_naver(f"index/{code}/basic"))
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] 지수 {code} 실시간 실패: {e}")
     try:
         import FinanceDataReader as fdr
 
         start = (dt.datetime.now(KST) - dt.timedelta(days=10)).strftime("%Y-%m-%d")
         c = fdr.DataReader(symbol, start)["Close"].dropna()
+        print(f"[warn] 지수 {code}: 일봉 기준으로 대신 계산 (기준일 {c.index[-1]:%m-%d})")
         return float((c.iloc[-1] / c.iloc[-2] - 1) * 100)
     except Exception as e:  # noqa: BLE001
         print(f"[warn] 지수 {symbol} 실패: {e}")
         return None
 
 
+def fetch_quote(code: str) -> dict | None:
+    """종목 실시간 현재가·등락률(네이버)."""
+    try:
+        d = _naver(f"stock/{code}/basic")
+        q = {"price": _num(d["closePrice"]), "chg": _signed_ratio(d)}
+        traded = d.get("localTradedAt") or ""
+        q["date"] = traded[:10] if re.match(r"\d{4}-\d{2}-\d{2}", traded) else None
+        return q
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] {code} 실시간 시세 실패: {e}")
+        return None
+
+
+def apply_quote(df: pd.DataFrame, q: dict | None) -> pd.DataFrame:
+    """일봉 마지막 값을 실시간 현재가로 맞춤 (오늘 봉이 없으면 추가)."""
+    if not q:
+        return df
+    df = df.copy()
+    price = q["price"]
+    last_day = df.index[-1].strftime("%Y-%m-%d")
+    if q.get("date") and q["date"] > last_day:
+        df.loc[pd.Timestamp(q["date"])] = [price, price, price, price, 0.0]
+    elif q.get("date") is None or q["date"] == last_day:
+        i = df.index[-1]
+        df.loc[i, "Close"] = price
+        df.loc[i, "High"] = max(df.loc[i, "High"], price)
+        df.loc[i, "Low"] = min(df.loc[i, "Low"], price)
+    return df
+
+
 def fetch_fear_greed() -> dict | None:
     """CNN 공포탐욕지수 (0=극단적 공포, 100=극단적 탐욕)."""
     import requests
 
-    try:
-        r = requests.get(
-            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-            headers={**UA, "Referer": "https://edition.cnn.com/"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        fg = r.json()["fear_and_greed"]
-        return {"score": round(float(fg["score"]), 1), "rating": fg.get("rating", "")}
-    except Exception as e:  # noqa: BLE001
-        print(f"[warn] 공포탐욕지수 실패: {e}")
-        return None
+    today = dt.datetime.now(KST).strftime("%Y-%m-%d")
+    for url in (
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+        f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{today}",
+    ):
+        try:
+            r = requests.get(
+                url,
+                headers={**UA, "Referer": "https://edition.cnn.com/", "Origin": "https://edition.cnn.com"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            fg = r.json()["fear_and_greed"]
+            return {"score": round(float(fg["score"]), 1), "rating": fg.get("rating", "")}
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] 공포탐욕지수 실패 ({url[-30:]}): {e}")
+    return None
 
 
 def fetch_news(name: str, limit: int = 5) -> list[dict]:
@@ -460,7 +530,11 @@ def main() -> int:
             df = fetch_ohlcv(s["code"])
             if len(df) < 130:
                 raise ValueError(f"일봉 {len(df)}개뿐")
-            rows.append(analyze(s, df, pf, fg, fetch_news(s["name"])))
+            q = fetch_quote(s["code"])
+            row = analyze(s, apply_quote(df, q), pf, fg, fetch_news(s["name"]))
+            if q:  # 등락률은 증권사 앱과 같은 공식 값 사용
+                row["chg"] = q["chg"]
+            rows.append(row)
         except Exception as e:  # noqa: BLE001
             print(f"[warn] {s['name']} 실패: {e}")
             rows.append({**s, "error": str(e)[:80]})
