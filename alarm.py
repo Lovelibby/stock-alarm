@@ -211,11 +211,24 @@ def news_score(headlines: list[dict], cfg: dict) -> int:
 
 # ---------------------------------------------------------------- 신호 판정
 
-def evaluate(ind: pd.DataFrame, fg: dict | None, nscore: int) -> dict:
-    t = CONFIG["thresholds"]
-    last, prev = ind.iloc[-1], ind.iloc[-2]
-    buy, sell = [], []
+def crosses(last: pd.Series, prev: pd.Series) -> list[tuple[str, str]]:
+    """(방향, 이름) 목록. 단기 5/20, 중기 20/60 골든·데드크로스."""
+    out = []
+    for a, b, tag in ((5, 20, "단기"), (20, 60, "중기")):
+        pa, pb, la, lb = prev[f"MA{a}"], prev[f"MA{b}"], last[f"MA{a}"], last[f"MA{b}"]
+        if np.isnan([pa, pb, la, lb]).any():
+            continue
+        if pa <= pb and la > lb:
+            out.append(("buy", f"{a}일선↗{b}일선 골든크로스({tag})"))
+        if pa >= pb and la < lb:
+            out.append(("sell", f"{a}일선↘{b}일선 데드크로스({tag})"))
+    return out
 
+
+def tech_reasons(last: pd.Series, prev: pd.Series) -> tuple[list[str], list[str]]:
+    """종목 자체 기술적 지표로 매수·매도 근거 목록을 만듦."""
+    t = CONFIG["thresholds"]
+    buy, sell = [], []
     rsi, cci, close = last["RSI"], last["CCI"], last["Close"]
     if rsi <= t["rsi_oversold"]:
         buy.append(f"RSI {rsi:.1f} 과매도")
@@ -234,14 +247,20 @@ def evaluate(ind: pd.DataFrame, fg: dict | None, nscore: int) -> dict:
     if close >= last["BB_UP"]:
         sell.append("볼린저 상단 터치")
 
-    if prev["MA5"] <= prev["MA20"] and last["MA5"] > last["MA20"]:
-        buy.append("5일선↗20일선 골든크로스")
-    elif prev["Close"] < prev["MA20"] and close >= last["MA20"]:
+    cx = crosses(last, prev)
+    buy += [n for d, n in cx if d == "buy"]
+    sell += [n for d, n in cx if d == "sell"]
+    if not any(d == "buy" and "단기" in n for d, n in cx) and prev["Close"] < prev["MA20"] and close >= last["MA20"]:
         buy.append("20일선 회복")
-    if prev["MA5"] >= prev["MA20"] and last["MA5"] < last["MA20"]:
-        sell.append("5일선↘20일선 데드크로스")
-    elif prev["Close"] > prev["MA20"] and close < last["MA20"]:
+    if not any(d == "sell" and "단기" in n for d, n in cx) and prev["Close"] > prev["MA20"] and close < last["MA20"]:
         sell.append("20일선 이탈")
+    return buy, sell
+
+
+def evaluate(ind: pd.DataFrame, fg: dict | None, nscore: int) -> dict:
+    t = CONFIG["thresholds"]
+    last, prev = ind.iloc[-1], ind.iloc[-2]
+    buy, sell = tech_reasons(last, prev)
 
     # 여기까지가 종목 자체 기술적 지표. 아래(시장 심리·뉴스)는 보조 가점이라
     # 기술적 지표가 하나도 없으면 신호를 내지 않음 (시장 공포만으로 전 종목 매수 신호가 뜨는 것 방지)
@@ -342,29 +361,83 @@ def save_state(state: dict) -> None:
 
 # ---------------------------------------------------------------- 대시보드
 
-def sparkline(ind: pd.DataFrame, n: int = 60) -> str:
+def history_marks(ind: pd.DataFrame, n: int = 60) -> list[dict]:
+    """최근 n일 동안 매일 같은 기준(기술적 지표 2개 이상)으로 판정한 과거 신호와 크로스."""
+    min_score = CONFIG["signal"]["min_score"]
+    marks = []
+    was_buy = was_sell = False
+    start = max(1, len(ind) - n)
+    for i in range(start, len(ind)):
+        last, prev = ind.iloc[i], ind.iloc[i - 1]
+        if np.isnan(last[["RSI", "CCI", "BB_UP", "MA20"]].astype(float)).any():
+            continue
+        b, s = tech_reasons(last, prev)
+        day = ind.index[i].strftime("%m/%d")
+        for d, name in crosses(last, prev):
+            marks.append({"i": i - start, "kind": "gc" if d == "buy" else "dc", "label": name, "day": day})
+        # 신호가 며칠 연속되면 차트가 화살표로 덮이므로, 신호가 '처음 켜진 날'만 표시
+        is_buy, is_sell = len(b) >= min_score, len(s) >= min_score
+        if is_buy and not was_buy:
+            marks.append({"i": i - start, "kind": "buy", "label": ", ".join(b), "day": day})
+        if is_sell and not was_sell:
+            marks.append({"i": i - start, "kind": "sell", "label": ", ".join(s), "day": day})
+        was_buy, was_sell = is_buy, is_sell
+    return marks
+
+
+def chart(ind: pd.DataFrame, marks: list[dict], n: int = 60) -> str:
     d = ind.tail(n)
-    vals = pd.concat([d["Close"], d["BB_UP"], d["BB_LO"]]).dropna()
+    cols = ["Close", "BB_UP", "BB_LO", "MA5", "MA20", "MA60"]
+    vals = d[cols].stack().dropna()
     lo, hi = float(vals.min()), float(vals.max())
-    w, h = 300, 70
-    span = hi - lo or 1
+    w, h, pad = 320, 150, 12
+    span = (hi - lo) or 1
+    step = w / max(len(d) - 1, 1)
 
-    def pts(s: pd.Series) -> str:
-        s = s.reset_index(drop=True)
-        return " ".join(
-            f"{i * w / (len(s) - 1):.1f},{h - (v - lo) / span * h:.1f}"
-            for i, v in s.items()
-            if not np.isnan(v)
-        )
+    def x(i: int) -> float:
+        return i * step
 
+    def y(v: float) -> float:
+        return pad + (hi - v) / span * (h - 2 * pad)
+
+    def line(col: str, cls: str) -> str:
+        pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(d[col]) if not np.isnan(v))
+        return f'<polyline class="{cls}" points="{pts}"/>' if pts else ""
+
+    svg = [line("BB_UP", "bb"), line("BB_LO", "bb"), line("MA60", "ma60"), line("MA20", "ma20"),
+           line("MA5", "ma5"), line("Close", "px")]
+    for m in marks:
+        i = m["i"]
+        if i >= len(d):
+            continue
+        px = float(d["Close"].iloc[i])
+        cx = x(i)
+        title = f"<title>{html.escape(m['day'] + ' ' + m['label'])}</title>"
+        if m["kind"] == "buy":
+            yy = min(y(px) + 10, h - 2)
+            svg.append(f'<path class="mk-buy" d="M{cx:.1f},{yy - 7:.1f} l-5,8 h10 z">{title}</path>')
+        elif m["kind"] == "sell":
+            yy = max(y(px) - 10, 2)
+            svg.append(f'<path class="mk-sell" d="M{cx:.1f},{yy + 7:.1f} l-5,-8 h10 z">{title}</path>')
+        else:
+            ma = float(d["MA20"].iloc[i])
+            cls = "mk-gc" if m["kind"] == "gc" else "mk-dc"
+            svg.append(f'<circle class="{cls}" cx="{cx:.1f}" cy="{y(ma):.1f}" r="4.5">{title}</circle>')
+    first, last_day = d.index[0].strftime("%m/%d"), d.index[-1].strftime("%m/%d")
     return (
-        f'<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" class="spark" role="img" '
-        f'aria-label="최근 {n}일 종가와 볼린저밴드">'
-        f'<polyline class="bb" points="{pts(d["BB_UP"])}"/>'
-        f'<polyline class="bb" points="{pts(d["BB_LO"])}"/>'
-        f'<polyline class="ma" points="{pts(d["MA20"])}"/>'
-        f'<polyline class="px" points="{pts(d["Close"])}"/></svg>'
+        f'<svg viewBox="0 0 {w} {h}" class="chart" role="img" '
+        f'aria-label="최근 {n}일 종가·이동평균선·볼린저밴드와 매수·매도 표시">{"".join(svg)}</svg>'
+        f'<div class="axis"><span>{first}</span><span>{last_day}</span></div>'
     )
+
+
+def recent_marks_html(marks: list[dict], k: int = 4) -> str:
+    names = {"buy": ("▲ 매수", "buy"), "sell": ("▼ 매도", "sell"), "gc": ("● 골든", "gc"), "dc": ("● 데드", "dc")}
+    items = []
+    for m in reversed(marks[-k:]):
+        t, cls = names[m["kind"]]
+        items.append(f'<li><b class="{cls}">{m["day"]} {t}</b> {html.escape(m["label"])}</li>')
+    return f'<ul class="hist">{"".join(items)}</ul>' if items else '<p class="muted small">최근 60일 신호 없음</p>'
 
 
 def render_dashboard(rows: list[dict], fg: dict | None, idx: dict, now: dt.datetime, show_pf: bool) -> str:
@@ -421,6 +494,7 @@ def render_dashboard(rows: list[dict], fg: dict | None, idx: dict, now: dt.datet
   </div>
   <div class="mas">종가 위/아래: {ma_state}</div>
   {f'<ul class="reasons">{"".join(reasons)}</ul>' if reasons else ""}
+  <details><summary>최근 매매 타이밍 기록</summary>{r["hist"]}</details>
   {f'<details><summary>최근 뉴스</summary><ul class="news">{news}</ul></details>' if news else ""}
 </div>""")
 
@@ -460,8 +534,13 @@ label{{display:block;font-size:12px}}.card{{background:var(--card);border:1px so
 .up{{color:var(--up)}}.down{{color:var(--down)}}.lo{{color:var(--buy)}}.hi{{color:var(--sell)}}
 .b{{font-size:13px;font-weight:600;padding:3px 9px;border-radius:99px;margin-left:4px}}.b.buy{{background:#0f9d5822;color:var(--buy)}}.b.sell{{background:#e5383b22;color:var(--sell)}}.b.none{{background:var(--line);color:var(--mut)}}
 .grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}}.grid b{{font-size:17px}}
-.spark{{width:100%;height:70px;margin-top:6px}}.spark polyline{{fill:none;stroke-width:1.5;vector-effect:non-scaling-stroke}}
-.spark .px{{stroke:var(--fg)}}.spark .bb{{stroke:var(--mut);stroke-dasharray:3 3;opacity:.6}}.spark .ma{{stroke:#f59e0b}}
+.chart{{width:100%;height:auto;margin-top:6px;overflow:visible}}.chart polyline{{fill:none;stroke-width:1.4}}
+.chart .px{{stroke:var(--fg);stroke-width:1.8}}.chart .bb{{stroke:var(--mut);stroke-dasharray:3 3;opacity:.6}}
+.chart .ma5{{stroke:#ec4899;opacity:.8}}.chart .ma20{{stroke:#f59e0b}}.chart .ma60{{stroke:#8b5cf6}}
+.mk-buy{{fill:var(--buy)}}.mk-sell{{fill:var(--sell)}}.mk-gc{{fill:#facc15;stroke:#a16207;stroke-width:1}}.mk-dc{{fill:#64748b;stroke:#0f172a;stroke-width:1}}
+.axis{{display:flex;justify-content:space-between;font-size:11px;color:var(--mut)}}
+.legend{{font-size:12px;color:var(--mut);display:flex;flex-wrap:wrap;gap:4px 10px;margin:6px 0}}.legend i{{font-style:normal;font-weight:700}}
+.hist{{margin:6px 0 0;padding-left:16px;font-size:13px}}.hist .buy{{color:var(--buy)}}.hist .sell{{color:var(--sell)}}.hist .gc{{color:#ca8a04}}.hist .dc{{color:#64748b}}.small{{font-size:13px}}
 .mas{{font-size:13px;margin-top:8px}}.mas span{{margin-right:6px;font-weight:600}}
 .reasons{{margin:8px 0 0;padding-left:18px;font-size:14px}}li.buy{{color:var(--buy)}}li.sell{{color:var(--sell)}}
 .pf{{display:flex;justify-content:space-between;font-size:14px}}details{{margin-top:8px;font-size:14px}}.news a{{color:inherit}}
@@ -469,12 +548,15 @@ footer{{font-size:12px;color:var(--mut);margin:20px 0}}
 </style></head><body><main>
 <h1>내 주식 타이밍 보드</h1>
 <div class="muted">{now:%Y-%m-%d %H:%M} 기준 · 신호 {n_sig}개 · 10분마다 새로고침</div>
+<div class="legend"><span><i style="color:var(--buy)">▲</i> 매수 타이밍</span><span><i style="color:var(--sell)">▼</i> 매도 타이밍</span>
+<span><i style="color:#facc15">●</i> 골든크로스</span><span><i style="color:#64748b">●</i> 데드크로스</span>
+<span><i style="color:#ec4899">―</i> 5일선</span><span><i style="color:#f59e0b">―</i> 20일선</span><span><i style="color:#8b5cf6">―</i> 60일선</span><span>┄ 볼린저</span></div>
 <div class="sum">
   <div><label>공포탐욕(CNN)</label><b class="{fg_cls}">{fg_txt}</b></div>
   {idx_html}{total_html}
 </div>
 {"".join(cards)}
-<footer>그래프: 검정=종가, 주황=20일선, 점선=볼린저밴드(20,2). 신호 기준: 같은 방향 지표가 2개 이상이면 신호, 3개 이상이면 🔥.
+<footer>그래프의 ▲▼는 지난 60일 동안 같은 기준(종목 자체 지표 2개 이상)을 매일 적용한 결과예요. 신호 기준: 같은 방향 지표가 2개 이상이면 신호, 3개 이상이면 🔥.
 참고용 기술적 신호이며 투자 판단은 본인 몫입니다.</footer>
 </main></body></html>"""
 
@@ -506,7 +588,9 @@ def analyze(stock: dict, df: pd.DataFrame, pf: dict, fg: dict | None, news: list
         "bb_pos": float((last["Close"] - last["BB_LO"]) / width * 100) if width else 50.0,
         "signal": sig,
         "news": news,
-        "spark": sparkline(ind),
+        "marks": (marks := history_marks(ind)),
+        "spark": chart(ind, marks),
+        "hist": recent_marks_html(marks),
     }
     for n in CONFIG["indicators"]["ma"]:
         row[f"ma{n}"] = float(last[f"MA{n}"])
