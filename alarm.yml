@@ -1,0 +1,44 @@
+name: 주식 타이밍 알람
+
+on:
+  schedule:
+    # GitHub 시간은 UTC 기준 (한국시간 = UTC + 9시간)
+    - cron: "*/30 0-6 * * 1-5"   # 평일 09:00~15:30 (KST) 30분마다
+    - cron: "50 6 * * 1-5"       # 평일 15:50 (KST) 장 마감 확정값
+  workflow_dispatch: {}           # Actions 탭에서 'Run workflow'로 바로 실행
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stock-alarm
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 지표 계산 · 알림 · 대시보드 갱신
+        run: python alarm.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PORTFOLIO_JSON: ${{ secrets.PORTFOLIO_JSON }}
+          SHOW_PORTFOLIO: ${{ vars.SHOW_PORTFOLIO }}
+
+      - name: 결과 저장
+        run: |
+          git config user.name "stock-alarm-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json docs/index.html
+          git diff --cached --quiet || (git commit -m "대시보드 갱신 $(TZ=Asia/Seoul date '+%m-%d %H:%M')" && git push)
