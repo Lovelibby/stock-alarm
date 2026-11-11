@@ -10,5 +10,6 @@
  "2026-11-11:017670:sell": "normal",
  "2026-11-11:KRW-BTC:buy": "normal",
  "2026-11-11:KRW-ETH:buy": "strong",
- "2026-11-11:KRW-SOL:buy": "normal"
+ "2026-11-11:KRW-SOL:buy": "normal",
+ "2026-11-11:017670:buy": "normal"
 }
