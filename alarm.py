@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import scoring
+
 ROOT = Path(__file__).resolve().parent
 CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 STATE_PATH = ROOT / "state.json"
@@ -350,160 +352,34 @@ def news_score(headlines: list[dict], cfg: dict) -> int:
     return 0
 
 
-# ---------------------------------------------------------------- 신호 판정
+# ---------------------------------------------------------------- 신호 (점수 기반)
 
-def crosses(last: pd.Series, prev: pd.Series) -> list[tuple[str, str]]:
-    """(방향, 이름) 목록. 단기 5/20, 중기 20/60 골든·데드크로스."""
-    out = []
-    for a, b, tag in ((5, 20, "단기"), (20, 60, "중기")):
-        pa, pb, la, lb = prev[f"MA{a}"], prev[f"MA{b}"], last[f"MA{a}"], last[f"MA{b}"]
-        if np.isnan([pa, pb, la, lb]).any():
-            continue
-        if pa <= pb and la > lb:
-            out.append(("buy", f"{a}일선↗{b}일선 골든크로스({tag})"))
-        if pa >= pb and la < lb:
-            out.append(("sell", f"{a}일선↘{b}일선 데드크로스({tag})"))
-    return out
+def signal_from_scores(timing: dict, risk: dict, held: bool) -> dict:
+    """매수: 타이밍 75점 이상(85 이상 🔥). 매도: 보유 종목만, 매도위험 65 이상(80 이상 🐵)."""
+    tv, rv = timing["value"], risk["value"]
+    buy = "strong" if tv is not None and tv >= 85 else "normal" if tv is not None and tv >= 75 else None
+    sell = None
+    if held and rv is not None:
+        sell = "strong" if rv >= 80 else "normal" if rv >= 65 else None
+    return {"buy_level": buy, "sell_level": sell}
 
 
-def tech_reasons(last: pd.Series, prev: pd.Series, vol_scale: float = 1.0) -> tuple[list[str], list[str]]:
-    """종목 자체 기술적 지표로 매수·매도 근거 목록을 만듦."""
-    t = CONFIG["thresholds"]
-    buy, sell = [], []
-    rsi, cci, close = last["RSI"], last["CCI"], last["Close"]
-    if rsi <= t["rsi_oversold"]:
-        buy.append(f"RSI {rsi:.1f} 과매도")
-    if rsi >= t["rsi_overbought"]:
-        sell.append(f"RSI {rsi:.1f} 과매수")
-
-    if cci <= t["cci_oversold"]:
-        turning = " (반등 시작)" if cci > prev["CCI"] else ""
-        buy.append(f"CCI {cci:.0f} 과매도{turning}")
-    if cci >= t["cci_overbought"]:
-        turning = " (꺾이는 중)" if cci < prev["CCI"] else ""
-        sell.append(f"CCI {cci:.0f} 과매수{turning}")
-
-    if close <= last["BB_LO"]:
-        buy.append("볼린저 하단 터치")
-    if close >= last["BB_UP"]:
-        sell.append("볼린저 상단 터치")
-
-    surge = t.get("volume_surge", 2.0)
-    if last["VOL20"] and not np.isnan(last["VOL20"]) and last["Volume"] > 0:
-        ratio = last["Volume"] / vol_scale / last["VOL20"]
-        if ratio >= surge:
-            if close >= prev["Close"]:
-                buy.append(f"거래량 급증 {ratio:.1f}배 + 상승")
-            else:
-                sell.append(f"거래량 급증 {ratio:.1f}배 + 하락")
-
-    cx = crosses(last, prev)
-    buy += [n for d, n in cx if d == "buy"]
-    sell += [n for d, n in cx if d == "sell"]
-    if not any(d == "buy" and "단기" in n for d, n in cx) and prev["Close"] < prev["MA20"] and close >= last["MA20"]:
-        buy.append("20일선 회복")
-    if not any(d == "sell" and "단기" in n for d, n in cx) and prev["Close"] > prev["MA20"] and close < last["MA20"]:
-        sell.append("20일선 이탈")
-    return buy, sell
-
-
-def evaluate(ind: pd.DataFrame, fg: dict | None, nscore: int, inv: list[dict] | None = None,
-             vol_scale: float = 1.0) -> dict:
-    t = CONFIG["thresholds"]
-    last, prev = ind.iloc[-1], ind.iloc[-2]
-    buy, sell = tech_reasons(last, prev, vol_scale)
-
-    k = t.get("investor_days", 3)
-    if inv and len(inv) >= k:
-        net = [d["foreign"] + d["inst"] for d in inv[:k]]
-        if all(x > 0 for x in net):
-            buy.append(f"외국인·기관 {k}일 연속 순매수")
-        elif all(x < 0 for x in net):
-            sell.append(f"외국인·기관 {k}일 연속 순매도")
-
-    # 여기까지가 종목 자체 기술적 지표. 아래(시장 심리·뉴스)는 보조 가점이라
-    # 기술적 지표가 하나도 없으면 신호를 내지 않음 (시장 공포만으로 전 종목 매수 신호가 뜨는 것 방지)
-    tech_buy, tech_sell = len(buy), len(sell)
-
-    if fg:
-        if fg["score"] <= t["fear_extreme"]:
-            buy.append(f"{fg.get('label', '공포탐욕')} {fg['score']:.0f} 극단적 공포")
-        if fg["score"] >= t["greed_extreme"]:
-            sell.append(f"{fg.get('label', '공포탐욕')} {fg['score']:.0f} 극단적 탐욕")
-
-    if nscore > 0:
-        buy.append("호재 뉴스 우세")
-    if nscore < 0:
-        sell.append("악재 뉴스 우세")
-
-    s = CONFIG["signal"]
-
-    def level(n: int) -> str | None:
-        if n >= s["strong_score"]:
-            return "strong"
-        if n >= s["min_score"]:
-            return "normal"
-        return None
-
-    return {
-        "buy": buy,
-        "sell": sell,
-        "buy_level": level(len(buy)) if tech_buy else None,
-        "sell_level": level(len(sell)) if tech_sell else None,
-    }
-
-
-# ---------------------------------------------------------------- 쉬운 설명
-
-EXPLAIN = [
-    ("RSI", "과매도", "최근에 너무 빨리 많이 떨어진 상태예요. 이런 구간에서는 잠깐이라도 반등이 나오는 경우가 많아요."),
-    ("RSI", "과매수", "짧은 기간에 너무 많이 올라 과열된 상태예요. 쉬어가거나 조금 되돌아오기 쉬워요."),
-    ("CCI", "과매도", "주가가 평소 움직이던 범위보다 한참 아래로 내려왔어요. 원래 범위로 돌아오려는 힘이 생기기 쉬워요."),
-    ("CCI", "과매수", "주가가 평소 움직이던 범위보다 한참 위로 올라왔어요. 힘이 빠지면 내려오기 쉬워요."),
-    ("볼린저 하단", "", "주가가 평소 오르내리는 '통로'의 바닥에 닿았어요. 보통은 통로 안쪽으로 다시 올라오려 해요."),
-    ("볼린저 상단", "", "주가가 평소 오르내리는 '통로'의 천장에 닿았어요. 보통은 통로 안쪽으로 다시 내려오려 해요."),
-    ("골든크로스(단기)", "", "최근 5일 평균값이 20일 평균값 위로 올라섰어요. 몇 주 단위 흐름이 '하락→상승'으로 바뀌는 신호예요."),
-    ("데드크로스(단기)", "", "최근 5일 평균값이 20일 평균값 아래로 내려갔어요. 몇 주 단위 흐름이 '상승→하락'으로 바뀌는 신호예요."),
-    ("골든크로스(중기)", "", "20일 평균값이 60일 평균값 위로 올라섰어요. 몇 달 단위 흐름이 좋아지는 신호라 단기보다 무게가 커요."),
-    ("데드크로스(중기)", "", "20일 평균값이 60일 평균값 아래로 내려갔어요. 몇 달 단위 흐름이 나빠지는 신호라 단기보다 무게가 커요."),
-    ("20일선 회복", "", "한 달 평균 가격 아래 있던 주가가 다시 위로 올라왔어요. 하락을 멈추고 힘을 되찾는 모습이에요."),
-    ("20일선 이탈", "", "한 달 평균 가격 위에 있던 주가가 아래로 내려갔어요. 오르던 힘이 약해졌다는 뜻이에요."),
-    ("거래량 급증", "상승", "평소보다 훨씬 많은 사람이 사고팔면서 올랐어요. 거래가 실린 상승은 진짜 힘이 있는 경우가 많아요."),
-    ("거래량 급증", "하락", "평소보다 훨씬 많은 물량이 쏟아지며 떨어졌어요. 누군가 크게 팔고 나가는 중일 수 있어요."),
-    ("순매수", "", "외국인·기관 같은 '큰손'이 며칠째 사 모으고 있어요. 큰손이 사는 종목은 오르는 힘이 오래가는 편이에요."),
-    ("순매도", "", "외국인·기관 같은 '큰손'이 며칠째 팔고 있어요. 큰손이 파는 동안은 오르기 어려운 편이에요."),
-    ("극단적 공포", "", "시장 전체가 겁에 질려 있어요. 역사적으로 이럴 때 싸게 살 기회가 많았어요 (보조 지표)."),
-    ("극단적 탐욕", "", "시장 전체가 너무 들떠 있어요. 이럴 때는 조심하는 게 좋아요 (보조 지표)."),
-    ("호재 뉴스", "", "최근 2일 기사 중 좋은 소식이 더 많아요 (보조 지표)."),
-    ("악재 뉴스", "", "최근 2일 기사 중 나쁜 소식이 더 많아요 (보조 지표)."),
-]
-
-
-def explain(reason: str) -> str:
-    for a, b, text in EXPLAIN:
-        if a in reason and b in reason:
-            return text
-    return ""
-
-
-def summary_line(sig: dict) -> str:
-    """카드 맨 위에 보여줄 한 줄 결론."""
-    nb, ns = len(sig["buy"]), len(sig["sell"])
-    need = CONFIG["signal"]["min_score"]
-    if sig["buy_level"] and sig["sell_level"]:
-        return f"사라는 근거 {nb}개와 팔라는 근거 {ns}개가 섞여 있어요. 방향이 엇갈리니 서두르지 않는 게 좋아요."
-    if sig["buy_level"] == "strong":
-        return f"🔥 사라는 근거가 {nb}개나 겹쳤어요. 이 기준에서 가장 강한 매수 타이밍이에요. 한 번에 다 사기보다 나눠서 사는 걸 고려해 보세요."
-    if sig["buy_level"]:
-        return f"사라는 근거가 {nb}개 겹쳐 매수 타이밍이에요. 다만 더 떨어질 수도 있어서 나눠서 사는 게 안전해요."
+def summary_line(r: dict) -> str:
+    t, k, sig = r["timing"], r["risk"], r["signal"]
+    tv, kv = t["value"], k["value"]
+    if tv is None:
+        return "데이터가 부족해 판단을 보류해요."
     if sig["sell_level"] == "strong":
-        return f"🐵 팔라는 근거가 {ns}개나 겹쳤어요. 이 기준에서 가장 강한 매도 타이밍이에요. 수익 중이면 일부라도 챙기는 걸 고려해 보세요."
+        return f"🐵 매도 위험 {kv:.0f}점으로 강한 경고예요. 수익 중이면 상당 부분 이익 실현을 검토해 보세요."
     if sig["sell_level"]:
-        return f"팔라는 근거가 {ns}개 겹쳐 매도 타이밍이에요. 전부 팔기보다 일부 매도로 대응하는 방법도 있어요."
-    if nb or ns:
-        return (f"매수 근거 {nb}개 · 매도 근거 {ns}개로, 신호 기준({need}개)에 아직 못 미쳐요. "
-                "지금은 지켜보는 구간이에요.")
-    return "특별히 걸리는 지표가 없어요. 평소 흐름대로 움직이는 중이라 지켜보는 구간이에요."
+        return f"매도 위험 {kv:.0f}점으로 주의 구간이에요. 일부 이익 실현이나 비중 축소를 검토해 보세요."
+    if sig["buy_level"] == "strong":
+        return f"🔥 매수 타이밍 {tv:.0f}점으로 차트상 매우 좋은 진입 구간이에요. 분할매수 구간을 참고하세요."
+    if sig["buy_level"]:
+        return f"매수 타이밍 {tv:.0f}점으로 좋은 편이에요. 한 번에 사기보다 분할매수 구간에서 나눠 사는 게 안전해요."
+    if kv is not None and kv >= 45:
+        return f"매수 타이밍 {tv:.0f}점, 매도 위험 {kv:.0f}점이에요. 추세가 약해지는 중이라 지켜보는 게 좋아요."
+    return f"매수 타이밍 {tv:.0f}점({t['grade']}), 매도 위험 {kv:.0f}점({k['grade']})으로 특별한 신호는 없어요."
 
 
 # ---------------------------------------------------------------- 텔레그램
@@ -532,7 +408,7 @@ def won(x: float) -> str:
 def money(x: float, cur: str = "KRW") -> str:
     if cur == "USD":
         return f"${x:,.2f}"
-    return f"{x:,.0f}원" if x >= 100 else f"{x:,.2f}원"
+    return f"{x:,.0f}원" if abs(x) >= 100 else f"{x:,.2f}원"
 
 
 def price_txt(x: float, cur: str = "KRW") -> str:
@@ -551,42 +427,50 @@ def man(x: float, cur: str = "KRW") -> str:
 
 
 def build_alert(row: dict, side: str, fg: dict | None, idx: dict) -> str:
-    sig = row["signal"]
-    esc = lambda x: html.escape(x, quote=False)  # noqa: E731
-    reasons = sig[side]
-    strong = sig[f"{side}_level"] == "strong"
-    label = "매수" if side == "buy" else "매도"
-    icon = "🟢" if side == "buy" else "🔴"
-    big = (" 🔥" if side == "buy" else " 🐵") if strong else ""
+    esc = lambda x: html.escape(str(x), quote=False)  # noqa: E731
     cur = row.get("cur", "KRW")
-    tag = f"[{row['market']}] " if row.get("market") else ""
-    lines = [f"{icon}{big} <b>{esc(tag)}{'강한 ' if strong else ''}{label} 신호 — {esc(row['name'])}</b>"]
-    lines.append(f"현재가 {money(row['close'], cur)} ({row['chg']:+.2f}%)")
+    sig, plan = row["signal"], row["plan"]
+    strong = sig[f"{side}_level"] == "strong"
+    head = ("🟢" + (" 🔥" if strong else "") + f" <b>[{esc(row['market'])}] {'강한 ' if strong else ''}매수 타이밍")\
+        if side == "buy" else ("🔴" + (" 🐵" if strong else "") + f" <b>[{esc(row['market'])}] {'강한 ' if strong else ''}매도 경고")
+    lines = [f"{head} — {esc(row['name'])}</b>", f"현재가 {money(row['close'], cur)} ({row['chg']:+.2f}%)"]
     if row.get("qty"):
-        lines.append(
-            f"평단 {money(row['avg'], cur)} · 수익률 {row['ret']:+.1f}% · 평가손익 {money(row['pnl'], cur)}"
-        )
-    lines.append("근거: " + ", ".join(esc(r) for r in reasons))
-    whys = [explain(r) for r in reasons if explain(r)]
-    if whys:
-        lines.append("💡 쉽게 말하면")
-        lines += [f"• {esc(w)}" for w in whys[:3]]
-    lines.append(esc(summary_line(sig)))
-    lines.append(
-        f"RSI {row['rsi']:.1f} · CCI {row['cci']:.0f} · 볼린저 위치 {row['bb_pos']:.0f}%"
-    )
-    if row["news"]:
-        lines.append("뉴스: " + esc(row["news"][0]["title"][:60]))
+        lines.append(f"평단 {money(row['avg'], cur)} · 수익률 {row['ret']:+.1f}% · 평가손익 {money(row['pnl'], cur)}")
+    sc = row["timing"] if side == "buy" else row["risk"]
+    lines.append(f"<b>{'매수 타이밍' if side == 'buy' else '매도 위험'} {sc['value']:.0f}/{sc['scale']}점 ({esc(sc['grade'])})</b>"
+                 f" · 신뢰도 {sc['confidence']}%")
+    top = sorted([i for i in sc["items"] if i["score"] is not None],
+                 key=lambda i: -(i["score"] / i["max"]) if side == "buy" else -(i["score"] / i["max"]))[:3]
+    lines.append("💡 이유")
+    lines += [f"• {esc(i['name'])} {i['score']:.0f}/{i['max']}: {esc(i['reason'])}" for i in top]
+    if side == "buy":
+        if plan.get("buy_zone"):
+            lo, hi = plan["buy_zone"]
+            lines.append(f"📍 분할매수 구간 {money(lo, cur)}~{money(hi, cur)}")
+        lines.append(f"🛑 손절 고려 {money(plan['stop'], cur)} · 🎯 1차 {money(plan['target1'], cur)} / 2차 {money(plan['target2'], cur)}")
+    else:
+        lines.append(f"🎯 1차 목표 {money(plan['target1'], cur)} · 🛑 손절 고려 {money(plan['stop'], cur)}")
+    lines.append(esc(summary_line(row)))
     mk = []
     if fg:
         mk.append(f"{fg.get('label', '공포탐욕')} {fg['score']:.0f}")
-    for k, v in idx.items():
-        if v is not None:
-            mk.append(f"{k} {v:+.2f}%")
+    mk += [f"{k} {v:+.2f}%" for k, v in idx.items() if v is not None]
     if mk:
         lines.append("시장: " + " · ".join(mk))
-    lines.append(f"<i>{row['asof']} 기준 · 참고용 기술적 신호이며 투자 판단은 본인 몫입니다.</i>")
+    lines.append(f"<i>{row['asof']} 기준 · 차트 기반 참고 분석이며 투자 판단은 본인 몫입니다.</i>")
     return "\n".join(lines)
+
+
+def build_price_alert(row: dict, kind: str) -> str:
+    cur = row.get("cur", "KRW")
+    name = html.escape(row["name"], quote=False)
+    if kind == "target":
+        return (f"🎯 <b>[{row['market']}] 목표가 도달 — {name}</b>\n현재가 {money(row['close'], cur)} ≥ 목표가 "
+                f"{money(row['target'], cur)}\n수익률 {row['ret']:+.1f}% · 일부 이익 실현을 검토해 보세요.\n"
+                f"<i>단순 가격 도달 알림이에요. 매도 위험 {row['risk']['value']:.0f}점({row['risk']['grade']})도 함께 보세요.</i>")
+    return (f"🛑 <b>[{row['market']}] 손절가 도달 — {name}</b>\n현재가 {money(row['close'], cur)} ≤ 손절가 "
+            f"{money(row['stop'], cur)}\n수익률 {row['ret']:+.1f}% · 미리 정한 기준에 닿았어요.\n"
+            f"<i>단순 가격 도달 알림이에요. 투자 판단은 본인 몫입니다.</i>")
 
 
 # ---------------------------------------------------------------- 상태(중복 알림 방지)
@@ -601,47 +485,19 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-# ---------------------------------------------------------------- 대시보드
+# ---------------------------------------------------------------- 대시보드: 차트
 
-def history_marks(ind: pd.DataFrame, n: int = 260) -> list[dict]:
-    """최근 n일 동안 매일 같은 기준(기술적 지표 2개 이상)으로 판정한 과거 신호와 크로스."""
-    min_score = CONFIG["signal"]["min_score"]
-    marks = []
-    was_buy = was_sell = False
-    start = max(1, len(ind) - n)
-    for i in range(start, len(ind)):
-        last, prev = ind.iloc[i], ind.iloc[i - 1]
-        if np.isnan(last[["RSI", "CCI", "BB_UP", "MA20"]].astype(float)).any():
-            continue
-        b, s = tech_reasons(last, prev)
-        day = ind.index[i].strftime("%m/%d")
-        for d, name in crosses(last, prev):
-            marks.append({"i": i, "kind": "gc" if d == "buy" else "dc", "label": name, "day": day,
-                          "price": float(last["Close"]), "strong": False})
-        # 신호가 며칠 연속되면 차트가 화살표로 덮이므로, 신호가 '처음 켜진 날'만 표시
-        is_buy, is_sell = len(b) >= min_score, len(s) >= min_score
-        strong_score = CONFIG["signal"]["strong_score"]
-        px = float(last["Close"])
-        if is_buy and not was_buy:
-            marks.append({"i": i, "kind": "buy", "label": ", ".join(b), "day": day,
-                          "price": px, "strong": len(b) >= strong_score})
-        if is_sell and not was_sell:
-            marks.append({"i": i, "kind": "sell", "label": ", ".join(s), "day": day,
-                          "price": px, "strong": len(s) >= strong_score})
-        was_buy, was_sell = is_buy, is_sell
-    return marks
-
-
-def chart(ind: pd.DataFrame, marks: list[dict], n: int = 60, cur: str = "KRW", style: str = "line",
+def chart(ind: pd.DataFrame, marks: list[dict], n: int, cur: str, style: str, lv: dict,
           label_all: bool = True) -> str:
-    """일봉 차트. style='candle'이면 봉 차트, 'line'이면 선 차트. marks의 i는 ind 전체 기준 위치."""
+    """가격(봉/선) + 20·60·120일선 + 지지·저항선 + 매매 표시, 아래에 거래량·RSI·MACD."""
     start = max(len(ind) - n, 0)
     d = ind.iloc[start:]
-    # 봉 차트(1주·1달)는 볼린저·60일선을 빼서 봉이 크게 보이게 함
-    cols = ["High", "Low", "MA5", "MA20"] if style == "candle" else ["Close", "BB_UP", "BB_LO", "MA5", "MA20", "MA60"]
+    w, ph, pad = 320, 160, 22          # 가격 영역
+    vh, rh, mh, gap = 34, 38, 38, 8      # 거래량·RSI·MACD 영역
+    H = ph + gap + vh + gap + rh + gap + mh
+    cols = ["High", "Low", "MA20"] if style == "candle" else ["Close", "BB_UP", "BB_LO", "MA20", "MA60", "MA120"]
     vals = d[cols].stack().dropna()
     lo, hi = float(vals.min()), float(vals.max())
-    w, h, pad = 320, 170, 26
     span = (hi - lo) or 1
     step = w / max(len(d) - 1, 1) if style == "line" else w / max(len(d), 1)
     off = 0 if style == "line" else step / 2
@@ -650,67 +506,96 @@ def chart(ind: pd.DataFrame, marks: list[dict], n: int = 60, cur: str = "KRW", s
         return off + i * step
 
     def y(v: float) -> float:
-        return pad + (hi - v) / span * (h - 2 * pad)
+        return pad + (hi - v) / span * (ph - 2 * pad)
 
-    def line(col: str, cls: str) -> str:
-        pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(d[col]) if not np.isnan(v))
+    def line(col: str, cls: str, yf=y) -> str:
+        pts = " ".join(f"{x(i):.1f},{yf(v):.1f}" for i, v in enumerate(d[col]) if not np.isnan(v))
         return f'<polyline class="{cls}" points="{pts}"/>' if pts else ""
 
-    if style == "candle":
-        svg = [line("MA20", "ma20"), line("MA5", "ma5")]
-    else:
-        svg = [line("BB_UP", "bb"), line("BB_LO", "bb"), line("MA60", "ma60"), line("MA20", "ma20"), line("MA5", "ma5")]
+    svg = []
+    if style == "line":
+        svg += [line("BB_UP", "bb"), line("BB_LO", "bb")]
+    svg += [line("MA120", "ma120"), line("MA60", "ma60"), line("MA20", "ma20")]
+    # 지지·저항선 (현재 기준)
+    used: list[float] = []
+    for v, cls, tag in [(s, "sup", "지지") for s in lv["support"]] + [(r, "res", "저항") for r in lv["resistance"]]:
+        if lo <= v <= hi:
+            ty = y(v) - 2
+            while any(abs(ty - u) < 9 for u in used):  # 라벨끼리 겹치면 살짝 비켜 씀
+                ty += 9
+            used.append(ty)
+            svg.append(f'<line class="{cls}" x1="0" x2="{w}" y1="{y(v):.1f}" y2="{y(v):.1f}"/>'
+                       f'<text class="lvl {cls}t" x="2" y="{ty:.1f}">{tag} {man(v, cur)}</text>')
     if style == "candle":
         bw = max(step * 0.6, 1.5)
         for i, (_, r) in enumerate(d.iterrows()):
-            up = r["Close"] >= r["Open"]
+            c = "cu" if r["Close"] >= r["Open"] else "cd"
             top, bot = y(max(r["Open"], r["Close"])), y(min(r["Open"], r["Close"]))
-            svg.append(f'<line class="{"cu" if up else "cd"}" x1="{x(i):.1f}" x2="{x(i):.1f}" '
-                       f'y1="{y(r["High"]):.1f}" y2="{y(r["Low"]):.1f}"/>'
-                       f'<rect class="{"cu" if up else "cd"}" x="{x(i) - bw / 2:.1f}" y="{top:.1f}" '
-                       f'width="{bw:.1f}" height="{max(bot - top, 0.8):.1f}"/>')
+            svg.append(f'<line class="{c}" x1="{x(i):.1f}" x2="{x(i):.1f}" y1="{y(r["High"]):.1f}" y2="{y(r["Low"]):.1f}"/>'
+                       f'<rect class="{c}" x="{x(i) - bw / 2:.1f}" y="{top:.1f}" width="{bw:.1f}" height="{max(bot - top, 0.8):.1f}"/>')
     else:
         svg.append(line("Close", "px"))
+    # 매매 표시
     for m in marks:
         if m["i"] < start:
             continue
         i = m["i"] - start
         px = float(d["Close"].iloc[i])
-        cx = x(i)
-        title = "<title>" + html.escape(m["day"] + " " + money(m["price"], cur) + " · " + m["label"]) + "</title>"
-        tx = min(max(cx, 14), w - 14)
-        if m["kind"] in ("buy", "sell"):
-            up = m["kind"] == "buy"  # 매수는 가격 아래, 매도는 가격 위에 표시
-            ref = float(d["Low"].iloc[i] if up else d["High"].iloc[i]) if style == "candle" else px
-            yy = min(y(ref) + 12, h - 14) if up else max(y(ref) - 12, 14)
-            if m.get("strong"):
-                svg.append(f'<text class="emo" x="{cx:.1f}" y="{yy + 5:.1f}" text-anchor="middle">'
-                           f'{"🔥" if up else "🐵"}{title}</text>')
-            elif up:
-                svg.append(f'<path class="mk-buy" d="M{cx:.1f},{yy - 6:.1f} l-5,8 h10 z">{title}</path>')
-            else:
-                svg.append(f'<path class="mk-sell" d="M{cx:.1f},{yy + 6:.1f} l-5,-8 h10 z">{title}</path>')
-            if label_all or m.get("strong"):
-                ly = yy + 16 if up else yy - 10
-                svg.append(f'<text class="pl {"pb" if up else "ps"}" x="{tx:.1f}" y="{ly:.1f}" '
-                           f'text-anchor="middle">{man(px, cur)}</text>')
+        cx, up = x(i), m["kind"] == "buy"
+        ref = float(d["Low"].iloc[i] if up else d["High"].iloc[i]) if style == "candle" else px
+        yy = min(y(ref) + 12, ph - 12) if up else max(y(ref) - 12, 12)
+        title = "<title>" + html.escape(f'{m["day"]} {money(m["price"], cur)} · {m["label"]}') + "</title>"
+        if m.get("strong"):
+            svg.append(f'<text class="emo" x="{cx:.1f}" y="{yy + 5:.1f}" text-anchor="middle">{"🔥" if up else "🐵"}{title}</text>')
+        elif up:
+            svg.append(f'<path class="mk-buy" d="M{cx:.1f},{yy - 6:.1f} l-5,8 h10 z">{title}</path>')
         else:
-            ma = float(d["MA20"].iloc[i])
-            if np.isnan(ma):
-                continue
-            cls = "mk-gc" if m["kind"] == "gc" else "mk-dc"
-            svg.append(f'<circle class="{cls}" cx="{cx:.1f}" cy="{y(ma):.1f}" r="4.5">{title}</circle>')
+            svg.append(f'<path class="mk-sell" d="M{cx:.1f},{yy + 6:.1f} l-5,-8 h10 z">{title}</path>')
+        if label_all or m.get("strong"):
+            tx = min(max(cx, 14), w - 14)
+            svg.append(f'<text class="pl {"pb" if up else "ps"}" x="{tx:.1f}" y="{(yy + 16) if up else (yy - 10):.1f}" '
+                       f'text-anchor="middle">{man(px, cur)}</text>')
+    # 거래량
+    y0 = ph + gap
+    vmax = float(d["Volume"].max()) or 1
+    bw = max(step * 0.6, 1)
+    svg.append(f'<text class="pane-t" x="2" y="{y0 + 8}">거래량</text>')
+    # 막대를 하나하나 rect로 그리면 파일이 커져서, 색깔별로 path 하나에 모아서 그림
+    segs = {"vu": [], "vd": []}
+    for i, (o_, c_, v_) in enumerate(zip(d["Open"], d["Close"], d["Volume"])):
+        hgt = v_ / vmax * (vh - 4)
+        segs["vu" if c_ >= o_ else "vd"].append(f"M{x(i):.1f} {y0 + vh:.1f}v{-hgt:.1f}")
+    svg += [f'<path class="{k}b" style="stroke-width:{bw:.1f}" d="{"".join(v)}"/>' for k, v in segs.items() if v]
+    # RSI
+    y1 = y0 + vh + gap
+
+    def yr(v: float) -> float:
+        return y1 + (100 - v) / 100 * rh
+
+    svg.append(f'<rect class="zone" x="0" y="{yr(100):.1f}" width="{w}" height="{yr(70) - yr(100):.1f}"/>'
+               f'<rect class="zone" x="0" y="{yr(30):.1f}" width="{w}" height="{yr(0) - yr(30):.1f}"/>'
+               f'<text class="pane-t" x="2" y="{y1 + 8}">RSI {d["RSI"].iloc[-1]:.0f}</text>')
+    svg.append(line("RSI", "rsi", yr))
+    # MACD (막대 = MACD - 시그널)
+    y2 = y1 + rh + gap
+    hist = d["MACD_HIST"].fillna(0)
+    hm = float(hist.abs().max()) or 1
+    mid = y2 + mh / 2
+    svg.append(f'<line class="axis0" x1="0" x2="{w}" y1="{mid:.1f}" y2="{mid:.1f}"/>'
+               f'<text class="pane-t" x="2" y="{y2 + 8}">MACD</text>')
+    segs = {"vu": [], "vd": []}
+    for i, v in enumerate(hist):
+        hgt = abs(v) / hm * (mh / 2 - 2)
+        segs["vu" if v >= 0 else "vd"].append(f"M{x(i):.1f} {mid:.1f}v{-hgt if v >= 0 else hgt:.1f}")
+    svg += [f'<path class="{k}b" style="stroke-width:{bw:.1f}" d="{"".join(v)}"/>' for k, v in segs.items() if v]
     fmt = "%y/%m/%d" if n > 200 else "%m/%d"
-    first, last_day = d.index[0].strftime(fmt), d.index[-1].strftime(fmt)
-    return (
-        f'<svg viewBox="0 0 {w} {h}" class="chart" role="img" '
-        f'aria-label="최근 {len(d)}일 차트와 매수·매도 표시">{"".join(svg)}</svg>'
-        f'<div class="axis"><span>{first}</span><span>{last_day}</span></div>'
-    )
+    return (f'<svg viewBox="0 0 {w} {H}" class="chart" role="img" aria-label="최근 {len(d)}일 가격·거래량·RSI·MACD 차트">'
+            f'{"".join(svg)}</svg><div class="axis"><span>{d.index[0].strftime(fmt)}</span>'
+            f'<span>{d.index[-1].strftime(fmt)}</span></div>')
 
 
 def intraday_chart(df: pd.DataFrame, cur: str = "KRW") -> str:
-    """코인 1일 차트: 15분봉 캔들 + 평균가(전체 평균) 기준선. 일봉 지표 신호는 없음."""
+    """코인 1일 차트: 15분봉 캔들. 일봉 점수와는 별개로 흐름만 보는 용도."""
     w, h, pad = 320, 170, 18
     lo, hi = float(df["Low"].min()), float(df["High"].max())
     span = (hi - lo) or 1
@@ -723,24 +608,20 @@ def intraday_chart(df: pd.DataFrame, cur: str = "KRW") -> str:
     svg = []
     for i, (_, r) in enumerate(df.iterrows()):
         cx = step / 2 + i * step
-        up = r["Close"] >= r["Open"]
+        c = "cu" if r["Close"] >= r["Open"] else "cd"
         top, bot = y(max(r["Open"], r["Close"])), y(min(r["Open"], r["Close"]))
-        svg.append(f'<line class="{"cu" if up else "cd"}" x1="{cx:.1f}" x2="{cx:.1f}" y1="{y(r["High"]):.1f}" '
-                   f'y2="{y(r["Low"]):.1f}"/><rect class="{"cu" if up else "cd"}" x="{cx - bw / 2:.1f}" '
-                   f'y="{top:.1f}" width="{bw:.1f}" height="{max(bot - top, 0.8):.1f}"/>')
+        svg.append(f'<line class="{c}" x1="{cx:.1f}" x2="{cx:.1f}" y1="{y(r["High"]):.1f}" y2="{y(r["Low"]):.1f}"/>'
+                   f'<rect class="{c}" x="{cx - bw / 2:.1f}" y="{top:.1f}" width="{bw:.1f}" height="{max(bot - top, 0.8):.1f}"/>')
     hi_i, lo_i = int(df["High"].values.argmax()), int(df["Low"].values.argmin())
-    for idx, val, up in ((hi_i, hi, False), (lo_i, lo, True)):
-        cx = min(max(step / 2 + idx * step, 18), w - 18)
-        yy = y(val) + (12 if up else -5)
-        svg.append(f'<text class="pl {"pb" if up else "ps"}" x="{cx:.1f}" y="{yy:.1f}" text-anchor="middle">'
-                   f'{"저" if up else "고"} {man(val, cur)}</text>')
+    for idx_, val, up in ((hi_i, hi, False), (lo_i, lo, True)):
+        cx = min(max(step / 2 + idx_ * step, 18), w - 18)
+        svg.append(f'<text class="pl {"pb" if up else "ps"}" x="{cx:.1f}" y="{y(val) + (12 if up else -5):.1f}" '
+                   f'text-anchor="middle">{"저" if up else "고"} {man(val, cur)}</text>')
     chg = (df["Close"].iloc[-1] / df["Open"].iloc[0] - 1) * 100
-    return (
-        f'<svg viewBox="0 0 {w} {h}" class="chart" role="img" aria-label="최근 24시간 15분봉 차트">{"".join(svg)}</svg>'
-        f'<div class="axis"><span>{df.index[0]:%m/%d %H:%M}</span><span>24시간 {chg:+.2f}%</span>'
-        f'<span>{df.index[-1]:%H:%M}</span></div>'
-        f'<p class="muted small">1일 차트는 흐름만 보는 용도예요. 매수·매도 신호는 일봉 기준이라 3달 차트 등에서 확인하세요.</p>'
-    )
+    return (f'<svg viewBox="0 0 {w} {h}" class="chart" role="img" aria-label="최근 24시간 15분봉 차트">{"".join(svg)}</svg>'
+            f'<div class="axis"><span>{df.index[0]:%m/%d %H:%M}</span><span>24시간 {chg:+.2f}%</span>'
+            f'<span>{df.index[-1]:%H:%M}</span></div>'
+            f'<p class="muted small">1일 차트는 흐름만 보는 용도예요. 점수는 일봉 기준이에요.</p>')
 
 
 PERIODS = [("1w", "1주"), ("1m", "1달"), ("3m", "3달"), ("6m", "6달"), ("1y", "1년")]
@@ -752,7 +633,8 @@ def period_bars(mid: str) -> dict:
     return {"1w": 5, "1m": 21, "3m": 63, "6m": 126, "1y": 250}
 
 
-def charts_html(ind: pd.DataFrame, marks: list[dict], mid: str, cur: str, intraday: pd.DataFrame | None) -> str:
+def charts_html(ind: pd.DataFrame, marks: list[dict], mid: str, cur: str, lv: dict,
+                intraday: pd.DataFrame | None) -> str:
     out = []
     if mid == "coin":
         inner = intraday_chart(intraday, cur) if intraday is not None and len(intraday) > 5 \
@@ -760,100 +642,112 @@ def charts_html(ind: pd.DataFrame, marks: list[dict], mid: str, cur: str, intrad
         out.append(f'<div class="ch" data-p="1d">{inner}</div>')
     for key, n in period_bars(mid).items():
         style = "candle" if key in ("1w", "1m") else "line"
-        out.append(f'<div class="ch" data-p="{key}">{chart(ind, marks, n, cur, style, label_all=n <= 100)}</div>')
+        out.append(f'<div class="ch" data-p="{key}">{chart(ind, marks, n, cur, style, lv, label_all=n <= 100)}</div>')
     return "".join(out)
 
 
 def recent_marks_html(marks: list[dict], now_price: float, k: int = 6, cur: str = "KRW") -> str:
-    names = {"buy": ("▲ 매수", "buy"), "sell": ("▼ 매도", "sell"), "gc": ("● 골든크로스", "gc"), "dc": ("● 데드크로스", "dc")}
     items = []
     for m in reversed(marks[-k:]):
-        t, cls = names[m["kind"]]
-        if m.get("strong"):
-            t = ("🔥 강한 매수" if m["kind"] == "buy" else "🐵 강한 매도")
+        t = ("🔥 강한 매수" if m["strong"] else "▲ 매수") if m["kind"] == "buy" else ("🐵 강한 매도" if m["strong"] else "▼ 매도")
         diff = (now_price / m["price"] - 1) * 100
-        items.append(
-            f'<li><b class="{cls}">{m["day"]} {t}</b> <b>{money(m["price"], cur)}</b> '
-            f'<span class="{"up" if diff >= 0 else "down"}">(지금 {diff:+.1f}%)</span>'
-            f'<br><span class="muted">{html.escape(m["label"])}</span></li>'
-        )
-    return f'<ul class="hist">{"".join(items)}</ul>' if items else '<p class="muted small">최근 60일 신호 없음</p>'
+        items.append(f'<li><b class="{m["kind"]}">{m["day"]} {t}</b> <b>{money(m["price"], cur)}</b> '
+                     f'<span class="{"up" if diff >= 0 else "down"}">(지금 {diff:+.1f}%)</span>'
+                     f'<br><span class="muted">{html.escape(m["label"])}</span></li>')
+    return f'<ul class="hist">{"".join(items)}</ul>' if items else '<p class="muted small">최근 1년 신호 없음</p>'
+
+
+# ---------------------------------------------------------------- 대시보드: 카드
+
+def score_block(sc: dict, title: str, kind: str, open_: bool = False) -> str:
+    e = html.escape
+    if sc["value"] is None:
+        return f'<div class="sb"><b>{title}</b> <span class="muted">데이터 부족</span></div>'
+    pct = sc["value"] / sc["scale"] * 100
+    good = pct >= 75 if kind == "buy" else pct < 45
+    bad = pct < 50 if kind == "buy" else pct >= 65
+    cls = "good" if good else "bad" if bad else "mid"
+    rows = []
+    for it in sc["items"]:
+        if it["score"] is None:
+            rows.append(f'<tr class="na"><td>{e(it["name"])}</td><td>N/A</td><td>{e(it["reason"])}</td></tr>')
+        else:
+            w = it["score"] / it["max"] * 100
+            rows.append(f'<tr><td>{e(it["name"])}</td><td><b>{it["score"]:g}</b>/{it["max"]}'
+                        f'<div class="bar"><i class="{kind}" style="width:{w:.0f}%"></i></div></td>'
+                        f'<td>{e(it["reason"])}</td></tr>')
+    note = "" if sc["confidence"] == 100 else f" · 신뢰도 {sc['confidence']}% (N/A 항목 제외 환산)"
+    if sc.get("note"):
+        note += f" · {sc['note']}"
+    return (f'<div class="sb {cls}"><div class="sbh"><span>{title}</span><b>{sc["value"]:.0f}<small>/{sc["scale"]}</small></b>'
+            f'<em>{e(sc["grade"])}</em></div><div class="gauge"><i class="{kind}" style="width:{pct:.0f}%"></i></div>'
+            f'<details{" open" if open_ else ""}><summary>항목별 점수와 이유{note}</summary><table class="items">{"".join(rows)}</table></details></div>')
+
+
+def plan_block(r: dict, cur: str) -> str:
+    p = r["plan"]
+    cells = []
+    if p.get("buy_zone"):
+        lo_, hi_ = p["buy_zone"]
+        z2 = f' · 2차 {price_txt(p["buy_zone2"], cur)}' if p.get("buy_zone2") else ""
+        cells.append(f'<div><label>분할매수 구간</label><b class="lo">{price_txt(lo_, cur)}~{price_txt(hi_, cur)}</b>'
+                     f'<small>{z2}</small></div>')
+    cells.append(f'<div><label>손절 고려가</label><b class="hi">{price_txt(p["stop"], cur)}</b>'
+                 f'<small>지지선 − 하루 평균 변동폭</small></div>')
+    cells.append(f'<div><label>1차·2차 목표</label><b>{price_txt(p["target1"], cur)} / {price_txt(p["target2"], cur)}</b>'
+                 f'<small>{p["target_basis"]} 기준</small></div>')
+    if r.get("qty"):
+        if r.get("target"):
+            cells.append(f'<div><label>내 목표가까지</label><b>{(r["target"] / r["close"] - 1) * 100:+.1f}%</b></div>')
+        if r.get("stop"):
+            cells.append(f'<div><label>내 손절가까지</label><b>{(r["stop"] / r["close"] - 1) * 100:+.1f}%</b></div>')
+    return f'<div class="plan">{"".join(cells)}</div>'
 
 
 def render_cards(rows: list[dict], cur: str, show_pf: bool) -> str:
     e = html.escape
 
     def badge(r: dict) -> str:
-        s = r["signal"]
-        out = []
+        s, out = r["signal"], []
         if s["buy_level"]:
-            out.append(f'<span class="b buy">{"🔥 강한 " if s["buy_level"] == "strong" else ""}매수 신호</span>')
+            out.append(f'<span class="b buy">{"🔥 강한 " if s["buy_level"] == "strong" else ""}매수 타이밍</span>')
         if s["sell_level"]:
-            out.append(f'<span class="b sell">{"🐵 강한 " if s["sell_level"] == "strong" else ""}매도 신호</span>')
+            out.append(f'<span class="b sell">{"🐵 강한 " if s["sell_level"] == "strong" else ""}매도 경고</span>')
         return "".join(out) or '<span class="b none">관망</span>'
 
-    def rsi_cls(v: float) -> str:
-        return "lo" if v <= 30 else "hi" if v >= 70 else ""
-
-    def cci_cls(v: float) -> str:
-        return "lo" if v <= -100 else "hi" if v >= 100 else ""
+    def order(r: dict) -> float:
+        if r.get("error"):
+            return 999
+        s = r["signal"]
+        return -(2 if s["sell_level"] == "strong" or s["buy_level"] == "strong" else 1 if (s["sell_level"] or s["buy_level"]) else 0) * 100 \
+            - (r["timing"]["value"] or 0)
 
     cards = []
-    for r in sorted(rows, key=lambda r: 1 if r.get("error") else -(len(r["signal"]["buy"]) + len(r["signal"]["sell"]))):
+    for r in sorted(rows, key=order):
         if r.get("error"):
             cards.append(f'<div class="card"><h2>{e(r["name"])}</h2><p class="muted">데이터를 받지 못했어요: {e(r["error"])}</p></div>')
             continue
-
-        def li(x: str, cls: str) -> str:
-            why = explain(x)
-            return f'<li class="{cls}"><b>{e(x)}</b>{f"<span>{e(why)}</span>" if why else ""}</li>'
-
-        reasons = [li(x, "buy") for x in r["signal"]["buy"]] + [li(x, "sell") for x in r["signal"]["sell"]]
-        inv = r["inv"][:3]
-        if r.get("mid") != "kr":
-            inv_html = ""
-        elif inv:
-            inv_txt = " / ".join(f'{d["foreign"] + d["inst"]:+,.0f}' for d in inv)
-            inv_html = f'<div class="mas">외국인+기관 순매수(최근 3일, 주): <b>{e(inv_txt)}</b></div>'
-        else:
-            inv_html = '<div class="mas muted">외국인·기관 수급: 확인 불가</div>'
-        vr = r["vol_ratio"]
-        vol_html = "" if np.isnan(vr) else f'<div><label>거래량(평소 대비)</label><b class="{"hi" if vr >= 2 else ""}">{vr:.1f}배</b></div>'
         pf = ""
         if show_pf and r.get("qty"):
-            pf = (
-                f'<div class="pf"><span>평단 {money(r["avg"], cur)}</span>'
-                f'<span class="{"up" if r["ret"] >= 0 else "down"}">{r["ret"]:+.1f}% ({money(r["pnl"], cur)})</span></div>'
-            )
-        news = "".join(
-            f'<li><a href="{e(n["link"])}" target="_blank" rel="noopener">{e(n["title"])}</a></li>'
-            for n in r["news"][:3]
-        )
-        ma_state = " ".join(
-            f'<span class="{"up" if r["close"] >= r[f"ma{n}"] else "down"}">MA{n}</span>'
-            for n in CONFIG["indicators"]["ma"]
-            if not np.isnan(r[f"ma{n}"])
-        )
+            pf = (f'<div class="pf"><span>평단 {money(r["avg"], cur)}</span>'
+                  f'<span class="{"up" if r["ret"] >= 0 else "down"}">{r["ret"]:+.1f}% ({money(r["pnl"], cur)})</span></div>')
+        news = "".join(f'<li><a href="{e(n["link"])}" target="_blank" rel="noopener">{e(n["title"])}</a></li>'
+                       for n in r["news"][:3])
+        risk_title = "매도 위험" + ("" if r.get("qty") else " <small>(보유 시 참고)</small>")
+        sig = r["signal"]
         cards.append(f"""
 <div class="card">
   <div class="top"><h2>{e(r["name"])} <small>{e(r["code"])}</small></h2>{badge(r)}</div>
-  <div class="price"><b>{price_txt(r["close"], cur)}</b><span class="{"up" if r["chg"] >= 0 else "down"}">{r["chg"]:+.2f}%</span><span class="hl">고 {price_txt(r["day_hi"], cur)} · 저 {price_txt(r["day_lo"], cur)}</span></div>
+  <div class="price"><b>{price_txt(r["close"], cur)}</b><span class="{"up" if r["chg"] >= 0 else "down"}">{r["chg"]:+.2f}%</span>
+    <span class="hl">고 {price_txt(r["day_hi"], cur)} · 저 {price_txt(r["day_lo"], cur)}</span></div>
   {pf}
-  <div class="why {"sb" if r["signal"]["buy_level"] else "ss" if r["signal"]["sell_level"] else ""}">{e(summary_line(r["signal"]))}</div>
+  <div class="why {"sb2" if sig["buy_level"] else "ss" if sig["sell_level"] else ""}">{e(summary_line(r))}</div>
+  <div class="scores">{score_block(r["timing"], "매수 타이밍", "buy", bool(sig["buy_level"]))}{score_block(r["risk"], risk_title, "sell", bool(sig["sell_level"]))}</div>
+  {plan_block(r, cur)}
   {r["spark"]}
-  <div class="grid">
-    <div><label>RSI(14)</label><b class="{rsi_cls(r["rsi"])}">{r["rsi"]:.1f}</b></div>
-    <div><label>CCI(14)</label><b class="{cci_cls(r["cci"])}">{r["cci"]:.0f}</b></div>
-    <div><label>볼린저 위치</label><b>{r["bb_pos"]:.0f}%</b></div>
-    {vol_html}
-  </div>
-  <div class="mas">종가 위/아래: {ma_state}</div>
-  {inv_html}
-  {f'<div class="rtitle">💡 왜 이런 판단인지</div><ul class="reasons">{"".join(reasons)}</ul>' if reasons else ""}
   <details><summary>최근 매매 타이밍 기록</summary>{r["hist"]}</details>
   {f'<details><summary>최근 뉴스</summary><ul class="news">{news}</ul></details>' if news else ""}
 </div>""")
-
     return "".join(cards)
 
 
@@ -922,9 +816,22 @@ label{{display:block;font-size:12px}}.card{{background:var(--card);border:1px so
 .mas{{font-size:13px;margin-top:8px}}.mas span{{margin-right:6px;font-weight:600}}
 .reasons{{margin:4px 0 0;padding-left:18px;font-size:14px}}.reasons li{{margin-bottom:6px}}.reasons li span{{display:block;color:var(--fg);font-size:13px;opacity:.85}}
 .rtitle{{font-size:13px;font-weight:700;margin-top:10px}}
-.why{{font-size:14px;background:var(--bg);border-radius:10px;padding:8px 10px;margin:8px 0}}.why.sb{{border-left:4px solid var(--buy)}}.why.ss{{border-left:4px solid var(--sell)}}li.buy{{color:var(--buy)}}li.sell{{color:var(--sell)}}
+.why{{font-size:14px;background:var(--bg);border-radius:10px;padding:8px 10px;margin:8px 0}}.why.sb2{{border-left:4px solid var(--buy)}}.why.ss{{border-left:4px solid var(--sell)}}li.buy{{color:var(--buy)}}li.sell{{color:var(--sell)}}
 .pf{{display:flex;justify-content:space-between;font-size:14px}}details{{margin-top:8px;font-size:14px}}.news a{{color:inherit}}
-footer{{font-size:12px;color:var(--mut);margin:20px 0}}
+footer{{font-size:12px;color:var(--mut);margin:20px 0;line-height:1.6}}
+.chart .ma120{{stroke:#0ea5e9}}.chart line.sup,.chart line.res{{stroke-dasharray:4 3;stroke-width:1}}.chart line.sup{{stroke:var(--buy)}}.chart line.res{{stroke:var(--sell)}}
+.chart .lvl{{font-size:8px;font-weight:700;paint-order:stroke;stroke:var(--card);stroke-width:3px}}.chart .supt{{fill:var(--buy)}}.chart .rest{{fill:var(--sell)}}
+.chart .pane-t{{font-size:8px;fill:var(--mut)}}.chart .vub{{stroke:var(--up);opacity:.55;fill:none}}.chart .vdb{{stroke:var(--down);opacity:.55;fill:none}}
+.chart .zone{{fill:var(--mut);opacity:.08}}.chart .rsi{{stroke:#8b5cf6;stroke-width:1.2}}.chart .axis0{{stroke:var(--line)}}
+.scores{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0}}@media (max-width:520px){{.scores{{grid-template-columns:1fr}}}}
+.sb{{border:1px solid var(--line);border-radius:12px;padding:10px}}.sb.good{{border-color:var(--buy)}}.sb.bad{{border-color:var(--sell)}}
+.sbh{{display:flex;align-items:baseline;gap:6px}}.sbh span{{font-size:13px;font-weight:700}}.sbh b{{font-size:22px;margin-left:auto}}.sbh em{{font-style:normal;font-size:12px;color:var(--mut)}}
+.gauge,.bar{{height:6px;background:var(--line);border-radius:9px;overflow:hidden;margin-top:4px}}.bar{{height:4px;width:60px}}
+.gauge i,.bar i{{display:block;height:100%}}i.buy{{background:var(--buy)}}i.sell{{background:var(--sell)}}
+.items{{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}}.items td{{border-top:1px solid var(--line);padding:5px 4px;vertical-align:top}}
+.items td:first-child{{white-space:nowrap;font-weight:600}}.items td:nth-child(2){{white-space:nowrap}}.items tr.na{{color:var(--mut)}}
+.plan{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:6px;margin:6px 0}}.plan div{{background:var(--bg);border-radius:10px;padding:7px 9px}}
+.plan b{{display:block;font-size:14px}}.plan small{{font-size:11px}}.hist .buy{{color:var(--buy)}}.hist .sell{{color:var(--sell)}}
 .tabs{{position:sticky;top:0;z-index:5;display:flex;gap:6px;background:var(--bg);padding:10px 0;margin-top:6px}}
 .tab{{flex:1;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:10px;padding:9px 0;font:inherit;font-weight:700;cursor:pointer}}
 .pane{{scroll-margin-top:64px}}
@@ -937,12 +844,14 @@ footer{{font-size:12px;color:var(--mut);margin:20px 0}}
 <h1>내 주식 타이밍 보드</h1>
 <div class="muted">{now:%Y-%m-%d %H:%M} 기준 · 10분마다 새로고침</div>
 <nav class="tabs">{"".join(tabs)}</nav>
-<div class="legend"><span><i style="color:var(--buy)">▲</i> 매수 타이밍</span><span><i style="color:var(--sell)">▼</i> 매도 타이밍</span><span>🔥 강한 매수</span><span>🐵 강한 매도</span>
-<span><i style="color:#facc15">●</i> 골든크로스</span><span><i style="color:#64748b">●</i> 데드크로스</span>
-<span><i style="color:#ec4899">―</i> 5일선</span><span><i style="color:#f59e0b">―</i> 20일선</span><span><i style="color:#8b5cf6">―</i> 60일선</span><span>┄ 볼린저</span></div>
+<div class="legend"><span><i style="color:var(--buy)">▲</i> 매수 타이밍(75점↑)</span><span>🔥 강한 매수(85점↑)</span><span><i style="color:var(--sell)">▼</i> 매도 경고(65점↑)</span><span>🐵 강한 매도(80점↑)</span>
+<span><i style="color:#f59e0b">―</i> 20일선</span><span><i style="color:#8b5cf6">―</i> 60일선</span><span><i style="color:#0ea5e9">―</i> 120일선</span><span><i style="color:var(--buy)">┄</i> 지지선</span><span><i style="color:var(--sell)">┄</i> 저항선</span><span>┄ 볼린저</span></div>
 {"".join(sections)}
-<footer>그래프의 ▲▼는 지난 60일 동안 같은 기준(종목 자체 지표 2개 이상)을 매일 적용한 결과예요. 신호 기준: 같은 방향 지표가 2개 이상이면 신호, 3개 이상이면 강한 신호(매수 🔥, 매도 🐵).
-참고용 기술적 신호이며 투자 판단은 본인 몫입니다.</footer>
+<footer><b>점수 기준</b> · 매수 타이밍 100점 = 중장기 추세 25 + 모멘텀(RSI·MACD) 20 + 거래량 15 + 수급 15 + 지지·저항 15 + 시장 심리 10
+(85↑ 매우 좋음 · 75↑ 좋음 · 65↑ 관심 · 50↑ 관망 · 50 미만 나쁨).
+매도 위험 100점 = 추세 약화 20 + 과열·둔화 15 + 거래량·수급 15 + 시장 위험 10 + 밸류에이션 20 + 펀더멘털 20(재무 데이터 연결 전이라 보류, 나머지로 환산).
+매도 경고 알림은 보유 종목에만 보내요. 차트의 ▲▼🔥🐵는 과거 각 날짜에 그날까지의 차트 데이터로 같은 점수를 다시 계산한 결과예요(과거 수급·공포탐욕은 제외).
+차트 기반 참고 분석이며 투자 판단은 본인 몫입니다.</footer>
 </main>
 <script>
 (function () {{
@@ -978,6 +887,7 @@ footer{{font-size:12px;color:var(--mut);margin:20px 0}}
 # ---------------------------------------------------------------- 실행
 
 def load_portfolio() -> dict:
+    """PORTFOLIO_JSON 예: {"018260":{"qty":18,"avg":181864,"target":260000,"stop":200000}}"""
     raw = os.getenv("PORTFOLIO_JSON", "").strip()
     if not raw and (ROOT / "portfolio.json").exists():
         raw = (ROOT / "portfolio.json").read_text(encoding="utf-8")
@@ -989,43 +899,35 @@ def load_portfolio() -> dict:
 
 def analyze(stock: dict, df: pd.DataFrame, pf: dict, fg: dict | None, news: list[dict],
             inv: list[dict] | None = None, now: dt.datetime | None = None, market: dict | None = None,
-            intraday: pd.DataFrame | None = None) -> dict:
+            intraday: pd.DataFrame | None = None, idx_chg: float | None = None) -> dict:
     market = market or {"id": "kr", "name": "국장", "cur": "KRW"}
     mid, cur = market["id"], market["cur"]
-    ind = compute_indicators(df, CONFIG["indicators"])
+    ind = scoring.add_indicators(compute_indicators(df, CONFIG["indicators"]))
     last, prev = ind.iloc[-1], ind.iloc[-2]
     now = now or dt.datetime.now(KST)
     scale = session_elapsed(now, mid) if ind.index[-1].date() == market_today(now, mid) else 1.0
-    sig = evaluate(ind, fg, news_score(news, CONFIG["news"]), inv, scale)
-    vol_ratio = (last["Volume"] / scale / last["VOL20"]) if last["VOL20"] else float("nan")
-    width = last["BB_UP"] - last["BB_LO"]
+    lv = scoring.levels(ind)
+    timing = scoring.timing_score(ind, lv, fg, inv, mid, scale)
+    risk = scoring.sell_risk(ind, lv, fg, inv, idx_chg, mid, scale)
+    plan = scoring.price_plan(ind, lv)
+    marks = scoring.history(ind, max(period_bars(mid).values()), mid)
+    h = pf.get(stock["code"])
     row = {
-        **stock,
-        "mid": mid,
-        "market": market["name"],
-        "cur": cur,
+        **stock, "mid": mid, "market": market["name"], "cur": cur,
         "asof": ind.index[-1].strftime("%Y-%m-%d"),
         "close": float(last["Close"]),
         "chg": float((last["Close"] / prev["Close"] - 1) * 100),
-        "rsi": float(last["RSI"]),
-        "cci": float(last["CCI"]),
-        "bb_pos": float((last["Close"] - last["BB_LO"]) / width * 100) if width else 50.0,
-        "signal": sig,
+        "day_hi": float(last["High"]), "day_lo": float(last["Low"]),
+        "timing": timing, "risk": risk, "plan": plan,
+        "signal": signal_from_scores(timing, risk, held=bool(h)),
         "news": news,
-        "inv": inv or [],
-        "vol_ratio": float(vol_ratio),
-        "marks": (marks := history_marks(ind, max(period_bars(mid).values()))),
-        "spark": charts_html(ind, marks, mid, cur, intraday),
-        "day_hi": float(last["High"]),
-        "day_lo": float(last["Low"]),
+        "spark": charts_html(ind, marks, mid, cur, lv, intraday),
         "hist": recent_marks_html(marks, float(last["Close"]), cur=cur),
     }
-    for n in CONFIG["indicators"]["ma"]:
-        row[f"ma{n}"] = float(last[f"MA{n}"])
-    h = pf.get(stock["code"])
     if h:
         qty, avg = float(h["qty"]), float(h["avg"])
-        row.update(qty=qty, avg=avg, ret=(row["close"] / avg - 1) * 100, pnl=(row["close"] - avg) * qty)
+        row.update(qty=qty, avg=avg, ret=(row["close"] / avg - 1) * 100, pnl=(row["close"] - avg) * qty,
+                   target=h.get("target"), stop=h.get("stop"))
     return row
 
 
@@ -1060,6 +962,7 @@ def main() -> int:
     for m in load_markets():
         m = {"cur": "KRW", "source": "fdr", **m}
         fg, idx = market_context(m)
+        idx_chg = next((v for v in idx.values() if v is not None), None)
         rows = []
         for s in m["stocks"]:
             try:
@@ -1070,7 +973,7 @@ def main() -> int:
                 inv = fetch_investor(s["code"]) if m["id"] == "kr" else None
                 news = fetch_news(s.get("news") or s["name"], suffix=m.get("news_suffix", "주가"))
                 intra = fetch_upbit_intraday(s["code"]) if m["id"] == "coin" else None
-                row = analyze(s, apply_quote(df, q), pf, fg, news, inv, now, m, intra)
+                row = analyze(s, apply_quote(df, q), pf, fg, news, inv, now, m, intra, idx_chg)
                 if q:  # 등락률은 증권사 앱과 같은 공식 값 사용
                     row["chg"] = q["chg"]
                 rows.append(row)
@@ -1079,7 +982,7 @@ def main() -> int:
                 rows.append({**s, "mid": m["id"], "error": str(e)[:80]})
         markets.append({**m, "rows": rows, "fg": fg, "idx": idx})
 
-    # 알림: 같은 봉 날짜에 같은 신호는 1번만, 일반→강한 신호(🔥/🐵)로 올라가면 다시 알림
+    # 알림: 같은 날 같은 신호는 1번만, 일반→강한(🔥/🐵)으로 올라가면 다시 알림
     state = load_state()
     sent_any = 0
     for m in markets:
@@ -1096,6 +999,17 @@ def main() -> int:
                 if send_telegram(build_alert(r, side, m["fg"], m["idx"])):
                     sent_any += 1
                 state[key] = lvl
+            # 보유 종목: 내가 정한 목표가·손절가 도달 (단순 가격 알림)
+            for kind in ("target", "stop"):
+                lvl_price = r.get(kind)
+                if not lvl_price:
+                    continue
+                hit = r["close"] >= lvl_price if kind == "target" else r["close"] <= lvl_price
+                key = f"{r['asof']}:{r['code']}:{kind}"
+                if hit and key not in state:
+                    if send_telegram(build_price_alert(r, kind)):
+                        sent_any += 1
+                    state[key] = "hit"
     if state:  # 최근 7일치만 보관
         newest = dt.date.fromisoformat(max(k[:10] for k in state))
         cutoff = (newest - dt.timedelta(days=7)).isoformat()
