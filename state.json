@@ -1,6 +1,4 @@
 {
- "2026-11-12:108490:buy": "strong",
- "2026-11-12:AMZN:buy": "normal",
  "2026-11-13:108490:buy": "normal",
  "2026-11-16:108490:buy": "normal",
  "2026-11-16:058610:sell": "normal",
@@ -8,5 +6,6 @@
  "2026-11-18:108490:buy": "normal",
  "2026-11-18:AMZN:buy": "normal",
  "2026-11-19:108490:buy": "normal",
- "2026-11-19:AMZN:buy": "normal"
+ "2026-11-19:AMZN:buy": "normal",
+ "2026-11-20:AMZN:buy": "normal"
 }
